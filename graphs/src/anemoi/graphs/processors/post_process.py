@@ -147,3 +147,54 @@ class RemoveUnconnectedNodes(BaseMaskingProcessor):
                 connected_mask[edges.edge_index[1]] = True
 
         return connected_mask
+
+
+class RemoveSelfLoops(BaseMaskingProcessor):
+    @staticmethod
+    def get_edge_dim(edge_attr: str) -> int:
+        # edge_index has shape (2, n_edges) and other edge attributes have (n_edges, attr_dim)
+        return int(edge_attr == "edge_index")
+
+    @staticmethod
+    def select_by_mask(x: torch.Tensor, mask: torch.Tensor, dim: int = 1) -> torch.Tensor:
+        if dim == 0:
+            return x[~mask, :]
+        if dim == 1:
+            return x[:, ~mask]
+
+    @staticmethod
+    def get_loops_mask(edge_index: torch.Tensor) -> torch.Tensor:
+        return edge_index[0] == edge_index[1]
+
+    def compute_mask(self, graph: HeteroData):
+        pass
+
+    def update_graph(self, graph: HeteroData) -> HeteroData:
+        """Remove the self-loops.
+        Parameters
+        ----------
+        graph: HeteroData
+            The graph to post-process.
+        Returns
+        -------
+        HeteroData
+            The post-processed graph.
+        """
+        for (src, to, dst), edges in graph.edge_items():
+            print((src, to, dst))
+            print(edges)
+            if src != dst:
+                # Self-loops are only considered for bipartite graphs (src -> dst) where src = dst.
+                continue
+            
+            mask = RemoveSelfLoops.get_loops_mask(edges["edge_index"])
+            if sum(mask) > 0:
+                LOGGER.info(f"A total of {sum(mask)} self-loops will be dropped from {src}->{dst} subgraph.")
+                for edge_attr_name in edges.edge_attrs():
+                    dim = RemoveSelfLoops.get_edge_dim(edge_attr_name)
+                    edge_attr = RemoveSelfLoops.select_by_mask(edges[edge_attr_name], mask, dim=dim)
+                    graph[(src, to, dst)][edge_attr_name] = edge_attr
+
+        return graph
+    
+    
