@@ -7,23 +7,15 @@
 # granted to it by virtue of its status as an intergovernmental organisation
 # nor does it submit to any jurisdiction.
 
-import datetime
+
 import logging
-import os
-import random
 from functools import cached_property
 
-import numpy as np
 import torch
-from rich.console import Console
-from rich.tree import Tree
+from einops import rearrange
 from torch.utils.data import IterableDataset
 
-from anemoi.models.distributed.balanced_partition import get_balanced_partition_range
-from anemoi.training.data.dataset import create_dataset
-from anemoi.training.data.usable_indices import get_usable_indices
-from anemoi.training.utils.seeding import get_base_seed
-from anemoi.utils.dates import frequency_to_seconds
+from anemoi.training.data.dataset.singledataset import NativeGridDataset
 
 LOGGER = logging.getLogger(__name__)
 
@@ -33,8 +25,8 @@ class MultiDataset(IterableDataset):
 
     def __init__(
         self,
-        data_readers: dict,
-        grid_indices: dict,
+        datasets_config: dict,
+        grid_indices_config: dict,
         relative_date_indices: list,
         timestep: str = "6h",
         shuffle: bool = True,
@@ -60,53 +52,44 @@ class MultiDataset(IterableDataset):
             label for the dataset, by default "multi"
         """
         self.label = label
-        self.shuffle = shuffle
-        self.timestep = timestep
-        self.dataset_names = list(data_readers.keys())
-        self.grid_indices = grid_indices
+        self.dataset_names = list(datasets_config.keys())
 
         # Create individual NativeGridDataset for each dataset with its own grid_indices
         self.datasets = {}
-        for name, data_reader in data_readers.items():
-            if name not in grid_indices:
+        for name, data_reader in datasets_config.items():
+            if name not in grid_indices_config:
                 msg = f"No grid_indices configuration found for dataset '{name}'"
                 raise ValueError(msg)
 
-            self.datasets[name] = create_dataset(data_reader)
+            self.datasets[name] = NativeGridDataset(
+                data_reader=data_reader,
+                grid_indices=grid_indices_config[name],
+                relative_date_indices=relative_date_indices,
+                timestep=timestep,
+                shuffle=shuffle,  # Will be overridden in __iter__
+                label=f"{label}_{name}",
+            )
 
-        # relative_date_indices are computed in terms of data frequency
-        # data_relative_date_indices are in terms of the specific dataset
-        self.data_relative_date_indices = np.array(
-            [self.timeincrement * idx for idx in relative_date_indices],
-            dtype=np.int64,
-        )
+        # Use the first dataset as the primary for shared properties
+        self.primary_dataset = next(iter(self.datasets.values()))
+
+        # Verify all datasets have the same number of valid indices
+        primary_count = len(self.primary_dataset.valid_date_indices)
+        for name, dataset in self.datasets.items():
+            dataset_count = len(dataset.valid_date_indices)
+            if dataset_count != primary_count:
+                msg = (
+                    f"Dataset '{name}' has {dataset_count} valid indices, "
+                    f"but expected {primary_count} to match other datasets"
+                )
+                raise ValueError(msg)
 
         LOGGER.info(
             "MultiDataset initialized with %d datasets (%s), %d valid indices each",
             len(self.datasets),
             ", ".join(self.dataset_names),
-            len(self.valid_date_indices),
+            primary_count,
         )
-
-        # lazy init model and reader group info, will be set by the DDPGroupStrategy:
-        self.model_comm_group_rank = 0
-        self.model_comm_num_groups = 1
-        self.model_comm_group_id = 0
-        self.global_rank = 0
-
-        self.reader_group_rank = 0
-        self.reader_group_size = 1
-
-        self.sample_comm_num_groups = 1  # groups that work on the same sample / batch
-        self.sample_comm_group_id = 0
-
-        self.ens_comm_group_rank = 0
-        self.ens_comm_num_groups = 1
-        self.ens_comm_group_id = 0
-
-        # additional state vars (lazy init)
-        self.n_samples_per_worker = 0
-        self.chunk_index_range: np.ndarray | None = None
 
     def _collect(self, attr_name: str) -> dict:
         """Helper method to collect attributes from all datasets."""
@@ -121,263 +104,51 @@ class MultiDataset(IterableDataset):
             getattr(dataset, method_name)(*args, **kwargs)
 
     @cached_property
-    def statistics(self) -> dict[str, dict]:
+    def statistics(self) -> dict:
         """Return combined statistics from all datasets."""
         return self._collect("statistics")
 
     @cached_property
-    def statistics_tendencies(self) -> dict[str, dict | None]:
+    def statistics_tendencies(self) -> dict:
         """Return combined tendency statistics from all datasets."""
-        return {name: dataset.statistics_tendencies(self.timestep) for name, dataset in self.datasets.items()}
+        return self._collect("statistics_tendencies")
 
     @cached_property
-    def metadata(self) -> dict[str, dict]:
+    def metadata(self) -> dict:
         """Return combined metadata from all datasets."""
         return self._collect("metadata")
 
     @cached_property
-    def supporting_arrays(self) -> dict[str, dict]:
+    def supporting_arrays(self) -> dict:
         """Return combined supporting arrays from all datasets."""
         return self._collect("supporting_arrays")
 
     @cached_property
-    def variables(self) -> dict[str, list[str]]:
-        """Return combined variables from all datasets."""
-        return self._collect("variables")
+    def name_to_index(self) -> dict:
+        """Return combined name_to_index mapping from all datasets."""
+        return self._collect("name_to_index")
+
+    @cached_property
+    def resolution(self) -> dict:
+        """Return combined resolution from all datasets."""
+        return self._collect("resolution")
 
     @property
     def data(self) -> dict:
         """Return data from all datasets as dictionary."""
         return self._collect("data")
 
-    @cached_property
-    def name_to_index(self) -> dict[str, dict]:
-        """Return combined name_to_index mapping from all datasets."""
-        return self._collect("name_to_index")
+    def set_comm_group_info(self, *args, **kwargs) -> None:
+        """Set communication group information for all datasets."""
+        self._apply_to_all_datasets("set_comm_group_info", *args, **kwargs)
 
-    @cached_property
-    def resolution(self) -> dict[str, str]:
-        """Return combined resolution from all datasets."""
-        return self._collect("resolution")
+    def set_ens_comm_group_info(self, *args, **kwargs) -> None:
+        """Set ensemble communication group information for all datasets."""
+        self._apply_to_all_datasets("set_ens_comm_group_info", *args, **kwargs)
 
-    @cached_property
-    def frequency(self) -> datetime.timedelta:
-        """Return combined frequency from all datasets."""
-        freqs = self._collect("frequency")
-        freq_ref = None
-        for name, freq in freqs.items():
-            if freq_ref is None:
-                freq_ref = freq
-            assert freq == freq_ref, f"Dataset '{name}' has different frequency than other datasets"
-        return freq_ref
-
-    @cached_property
-    def timeincrement(self) -> int:
-        try:
-            frequency = frequency_to_seconds(self.frequency)
-        except ValueError as e:
-            msg = f"Error in data frequency, {self.frequency}"
-            raise ValueError(msg) from e
-
-        try:
-            timestep = frequency_to_seconds(self.timestep)
-        except ValueError as e:
-            msg = f"Error in timestep, {self.timestep}"
-            raise ValueError(msg) from e
-
-        assert timestep % frequency == 0, (
-            f"Timestep ({self.timestep} == {timestep}) isn't a "
-            f"multiple of data frequency ({self.frequency} == {frequency})."
-        )
-
-        LOGGER.info(
-            "Timeincrement set to %s for data with frequency, %s, and timestep, %s",
-            timestep // frequency,
-            frequency,
-            timestep,
-        )
-        return timestep // frequency
-
-    @cached_property
-    def valid_date_indices(self) -> np.ndarray:
-        """Return valid date indices.
-
-        A date t is valid if we can sample the elements t + i
-        for every relative_date_index i across all datasets.
-
-        Returns the intersection of valid indices from all datasets.
-        """
-        valid_date_indices_intersection = None
-        for name, ds in self.datasets.items():
-            valid_date_indices = get_usable_indices(
-                ds.missing,
-                len(ds.dates),
-                self.data_relative_date_indices,
-                ds.trajectory_ids if ds.has_trajectories else None,
-            )
-            if valid_date_indices_intersection is None:
-                valid_date_indices_intersection = valid_date_indices
-            else:
-                valid_date_indices_intersection = np.intersect1d(valid_date_indices_intersection, valid_date_indices)
-
-            if len(valid_date_indices) == 0:
-                msg = f"No valid date indices found for dataset '{name}': \n{ds}"
-                raise ValueError(msg)
-
-            LOGGER.info("Dataset '%s' has %d valid indices", name, len(valid_date_indices))
-
-        if len(valid_date_indices_intersection) == 0:
-            msg = "No valid date indices found after intersection across all datasets."
-            raise ValueError(msg)
-
-        LOGGER.info("MultiDataset has %d valid indices after intersection.", len(valid_date_indices_intersection))
-
-        return valid_date_indices_intersection
-
-    def set_comm_group_info(
-        self,
-        global_rank: int,
-        model_comm_group_id: int,
-        model_comm_group_rank: int,
-        model_comm_num_groups: int,
-        reader_group_rank: int,
-        reader_group_size: int,
-    ) -> None:
-        """Set model and reader communication group information (called by DDPGroupStrategy).
-
-        Parameters
-        ----------
-        global_rank : int
-            Global rank
-        model_comm_group_id : int
-            Model communication group ID
-        model_comm_group_rank : int
-            Model communication group rank
-        model_comm_num_groups : int
-            Number of model communication groups
-        reader_group_rank : int
-            Reader group rank
-        reader_group_size : int
-            Reader group size
-        """
-        self.global_rank = global_rank
-        self.model_comm_group_id = model_comm_group_id
-        self.model_comm_group_rank = model_comm_group_rank
-        self.model_comm_num_groups = model_comm_num_groups
-        self.reader_group_rank = reader_group_rank
-        self.reader_group_size = reader_group_size
-
-        self.sample_comm_group_id = model_comm_group_id
-        self.sample_comm_num_groups = model_comm_num_groups
-
-        assert self.reader_group_size >= 1, f"reader_group_size(={self.reader_group_size}) must be positive"
-
-        LOGGER.info(
-            "NativeGridDataset.set_group_info(): global_rank %d, model_comm_group_id %d, "
-            "model_comm_group_rank %d, model_comm_num_groups %d, reader_group_rank %d, "
-            "sample_comm_group_id %d, sample_comm_num_groups %d",
-            global_rank,
-            model_comm_group_id,
-            model_comm_group_rank,
-            model_comm_num_groups,
-            reader_group_rank,
-            self.sample_comm_group_id,
-            self.sample_comm_num_groups,
-        )
-
-    def set_ens_comm_group_info(
-        self,
-        ens_comm_group_id: int,
-        ens_comm_group_rank: int,
-        ens_comm_num_groups: int,
-    ) -> None:
-        """Set ensemble communication group information (called by DDPGroupStrategy).
-
-        Parameters
-        ----------
-        ens_comm_group_id : int
-            Ensemble communication group ID
-        ens_comm_group_rank : int
-            Ensemble communication group rank
-        ens_comm_num_groups : int
-            Number of ensemble communication groups
-        """
-        self.ens_comm_group_id = ens_comm_group_id
-        self.ens_comm_group_rank = ens_comm_group_rank
-        self.ens_comm_num_groups = ens_comm_num_groups
-
-        self.sample_comm_group_id = ens_comm_group_id
-        self.sample_comm_num_groups = ens_comm_num_groups
-
-        LOGGER.info(
-            "NativeGridDataset.set_ens_comm_group_info(): global_rank %d, ens_comm_group_id %d, "
-            "ens_comm_group_rank %d, ens_comm_num_groups %d, reader_group_rank %d, "
-            "sample_comm_group_id %d, sample_comm_num_groups %d",
-            self.global_rank,
-            ens_comm_group_id,
-            ens_comm_group_rank,
-            ens_comm_num_groups,
-            self.reader_group_rank,
-            self.sample_comm_group_id,
-            self.sample_comm_num_groups,
-        )
-
-    def per_worker_init(self, n_workers: int, worker_id: int) -> None:
+    def per_worker_init(self, *args, **kwargs) -> None:
         """Initialize all datasets for this worker."""
-        self.worker_id = worker_id
-
-        # 1. divide valid date indices into shards for sample communication groups (DDP ranks)
-        # note that we need even splits here across DDP ranks, so we might throw away some samples
-        shard_size = len(self.valid_date_indices) // self.sample_comm_num_groups
-        shard_start = self.sample_comm_group_id * shard_size
-
-        self.n_samples_per_worker = shard_size // n_workers
-
-        # 2. partition the shard across workers (here we can have uneven splits, so we use a balanced partition)
-        low, high = get_balanced_partition_range(shard_size, n_workers, worker_id, offset=shard_start)
-
-        self.chunk_index_range = np.arange(low, high, dtype=np.uint32)
-
-        LOGGER.info(
-            "Worker %d (pid %d, global_rank %d, model comm group %d)  has low/high range %d / %d",
-            worker_id,
-            os.getpid(),
-            self.global_rank,
-            self.model_comm_group_id,
-            low,
-            high,
-        )
-
-        base_seed = get_base_seed()
-
-        torch.manual_seed(base_seed)
-        random.seed(base_seed)
-        self.rng = np.random.default_rng(seed=base_seed)
-        sanity_rnd = self.rng.random(1)
-        LOGGER.info(
-            ("Worker %d (%s, pid %d, base_seed %d, sanity rnd %f)"),
-            worker_id,
-            self.label,
-            os.getpid(),
-            base_seed,
-            sanity_rnd,
-        )
-
-    def get_sample(self, index: int) -> dict[str, torch.Tensor]:
-        start = index + self.data_relative_date_indices[0]
-        end = index + self.data_relative_date_indices[-1] + 1
-        if len(self.data_relative_date_indices) > 1:
-            timeincrement = self.data_relative_date_indices[1] - self.data_relative_date_indices[0]
-        else:
-            timeincrement = 1  # single time step
-        time_indices = slice(start, end, timeincrement)
-
-        x = {}
-        for name, dataset in self.datasets.items():
-            grid_shard_indices = self.grid_indices[name].get_shard_indices(self.reader_group_rank)
-            x[name] = dataset.get_sample(time_indices, grid_shard_indices)
-
-        return x
+        self._apply_to_all_datasets("per_worker_init", *args, **kwargs)
 
     def __iter__(self) -> dict[str, torch.Tensor]:
         """Return an iterator that yields dictionaries of synchronized samples.
@@ -390,35 +161,56 @@ class MultiDataset(IterableDataset):
         """
         # Get the shuffled indices from the primary dataset
         # All datasets will use the same shuffled indices for synchronization
-        if self.shuffle:
-            shuffled_chunk_indices = self.rng.choice(
-                self.valid_date_indices,
-                size=len(self.valid_date_indices),
+        primary_dataset = self.primary_dataset
+
+        if primary_dataset.shuffle:
+            shuffled_chunk_indices = primary_dataset.rng.choice(
+                primary_dataset.valid_date_indices,
+                size=len(primary_dataset.valid_date_indices),
                 replace=False,
-            )[self.chunk_index_range]
+            )[primary_dataset.chunk_index_range]
         else:
-            shuffled_chunk_indices = self.valid_date_indices[self.chunk_index_range]
+            shuffled_chunk_indices = primary_dataset.valid_date_indices[primary_dataset.chunk_index_range]
 
         LOGGER.debug(
-            "%s worker pid %d, worker id %d, using synchronized indices[0:10]: %s",
-            self.__class__.__name__,
-            os.getpid(),
-            self.worker_id,
+            "MultiDataset worker pid %d, worker id %d, using synchronized indices[0:10]: %s",
+            primary_dataset.worker_id,
+            primary_dataset.worker_id,
             shuffled_chunk_indices[:10],
         )
-        # TODO(): improve this...
-        for i in shuffled_chunk_indices:
-            yield self.get_sample(i)
+        # TODO: improve this...
+        dataset_iterators = {}
+        for name, dataset in self.datasets.items():
+            dataset_iterators[name] = self._build_dataset_iterator(dataset, shuffled_chunk_indices)
+
+        for _ in shuffled_chunk_indices:
+            sample_dict = {}
+            for name in self.dataset_names:
+                sample_dict[name] = next(dataset_iterators[name])
+            yield sample_dict
+
+    def _build_dataset_iterator(self, dataset: NativeGridDataset, indices):  # type: ignore[no-untyped-def]
+        """Create an iterator for a dataset using the provided indices."""
+        for i in indices:
+            start = i + dataset.relative_date_indices[0]
+            end = i + dataset.relative_date_indices[-1] + 1
+            timeincrement = dataset.relative_date_indices[1] - dataset.relative_date_indices[0]
+
+            grid_shard_indices = dataset.grid_indices.get_shard_indices(dataset.reader_group_rank)
+            if isinstance(grid_shard_indices, slice):
+                x = dataset.data[start:end:timeincrement, :, :, grid_shard_indices]
+            else:
+                x = dataset.data[start:end:timeincrement, :, :, :]
+                x = x[..., grid_shard_indices]
+
+            x = rearrange(x, "dates variables ensemble gridpoints -> dates ensemble gridpoints variables")
+            yield torch.from_numpy(x)
 
     def __repr__(self) -> str:
-        console = Console(record=True, width=120)
-        with console.capture() as capture:
-            console.print(self.tree())
-        return capture.get()
-
-    def tree(self) -> Tree:
-        tree = Tree(f"{self.__class__.__name__}")
-        for name, dataset in self.datasets.items():
-            subtree = dataset.tree(prefix=name)
-            tree.add(subtree)
-        return tree
+        dataset_info = "\n".join([f"  {name}: {dataset.data}" for name, dataset in self.datasets.items()])
+        return f"""
+            {super().__repr__()}
+            Datasets:
+{dataset_info}
+            Relative dates: {self.primary_dataset.relative_date_indices}
+        """
