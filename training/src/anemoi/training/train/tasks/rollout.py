@@ -39,10 +39,10 @@ class BaseRolloutGraphModule(BaseGraphModule, ABC):
         self,
         *,
         config: BaseSchema,
-        graph_data: dict[str, HeteroData],
+        graph_data: HeteroData,
         statistics: dict,
         statistics_tendencies: dict,
-        data_indices: dict[str, IndexCollection],
+        data_indices: IndexCollection,
         metadata: dict,
         supporting_arrays: dict,
     ) -> None:
@@ -52,11 +52,11 @@ class BaseRolloutGraphModule(BaseGraphModule, ABC):
         ----------
         config : DictConfig
             Job configuration
-        graph_data : dict[str, HeteroData]
-            Graph objects keyed by dataset name
+        graph_data : HeteroData
+            Graph object
         statistics : dict
             Statistics of the training data
-        data_indices : dict[str, IndexCollection]
+        data_indices : IndexCollection
             Indices of the training data,
         metadata : dict
             Provenance information
@@ -87,44 +87,31 @@ class BaseRolloutGraphModule(BaseGraphModule, ABC):
         x: torch.Tensor,
         y_pred: torch.Tensor,
         batch: torch.Tensor,
-        dataset_name: str,
-        rollout_step: int = 0,
+        rollout_step: int,
     ) -> torch.Tensor:
-        """Default implementation used by simple rollout tasks.
+        x = x.roll(-1, dims=1)
 
-        Supports model outputs shaped like:
-        - (B, T, E, G, V)
-        """
-        keep_steps = min(self.n_step_output, self.n_step_input)
+        # Get prognostic variables
+        x[:, -1, :, :, self.data_indices.model.input.prognostic] = y_pred[
+            ...,
+            self.data_indices.model.output.prognostic,
+        ]
 
-        x = x.roll(-keep_steps, dims=1)
+        x[:, -1] = self.output_mask.rollout_boundary(
+            x[:, -1],
+            batch[:, self.multi_step + rollout_step],
+            self.data_indices,
+            grid_shard_slice=self.grid_shard_slice,
+        )
 
-        # TODO(dieter): see if we can replace for loop with tensor operations
-        for i in range(keep_steps):
-            # Get prognostic variables
-            x[:, -(i + 1), ..., self.data_indices[dataset_name].model.input.prognostic] = y_pred[
-                :,
-                -(i + 1),
-                ...,
-                self.data_indices[dataset_name].model.output.prognostic,
-            ]
-
-            batch_time_index = self.n_step_input + (rollout_step + 1) * self.n_step_output - (i + 1)
-
-            x[:, -(i + 1)] = self.output_mask[dataset_name].rollout_boundary(
-                x[:, -(i + 1)],
-                batch[:, batch_time_index],
-                self.data_indices[dataset_name],
-                grid_shard_slice=self.grid_shard_slice[dataset_name],
-            )
-
-            # get new "constants" needed for time-varying fields
-            x[:, -(i + 1), ..., self.data_indices[dataset_name].model.input.forcing] = batch[
-                :,
-                batch_time_index,
-                ...,
-                self.data_indices[dataset_name].data.input.forcing,
-            ]
+        # get new "constants" needed for time-varying fields
+        x[:, -1, :, :, self.data_indices.model.input.forcing] = batch[
+            :,
+            self.multi_step + rollout_step,
+            :,
+            :,
+            self.data_indices.data.input.forcing,
+        ]
         return x
 
     def _advance_input(
@@ -139,18 +126,18 @@ class BaseRolloutGraphModule(BaseGraphModule, ABC):
                 x[dataset_name],
                 y_pred[dataset_name],
                 batch[dataset_name],
-                rollout_step=rollout_step,
-                dataset_name=dataset_name,
+                rollout_step,
             )
         return x
+
 
     def _compute_metrics(
         self,
         y_pred: torch.Tensor,
         y: torch.Tensor,
-        dataset_name: str,
         step: int | None = None,
         grid_shard_slice: slice | None = None,
+        dataset_name: str | None = None,
         **_kwargs,
     ) -> dict[str, torch.Tensor]:
         """Compute validation metrics.
@@ -174,7 +161,7 @@ class BaseRolloutGraphModule(BaseGraphModule, ABC):
             y,
             step=step,
             grid_shard_slice=grid_shard_slice,
-            dataset_name=dataset_name,
+            dataset_name=dataset_name
         )
 
     def training_step(self, batch: dict[str, torch.Tensor], batch_idx: int) -> torch.Tensor:
@@ -195,7 +182,7 @@ class BaseRolloutGraphModule(BaseGraphModule, ABC):
         validation_mode: bool = False,
     ) -> tuple[torch.Tensor, dict, list]:
         """Training / validation step."""
-        loss = torch.zeros(1, dtype=next(iter(batch.values())).dtype, device=self.device, requires_grad=False)
+        loss = torch.zeros(1, dtype= next(iter(batch.values())).dtype, device=self.device, requires_grad=False)
         metrics = {}
         y_preds = []
 
@@ -204,7 +191,7 @@ class BaseRolloutGraphModule(BaseGraphModule, ABC):
             rollout=self.rollout,
             validation_mode=validation_mode,
         ):
-            loss = loss + loss_next
+            loss += loss_next
             metrics.update(metrics_next)
             y_preds.append(y_preds_next)
 
