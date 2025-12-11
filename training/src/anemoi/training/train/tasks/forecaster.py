@@ -11,25 +11,20 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING
 
-import torch
 from torch.utils.checkpoint import checkpoint
 
-from anemoi.training.losses.scalers.base_scaler import AvailableCallbacks
-from anemoi.training.train.tasks.base import BaseGraphModule
+from anemoi.training.train.tasks.rollout import BaseRolloutGraphModule
 
 if TYPE_CHECKING:
     from collections.abc import Generator
-    from collections.abc import Mapping
 
-    from torch_geometric.data import HeteroData
+    import torch
 
-    from anemoi.models.data_indices.collection import IndexCollection
-    from anemoi.training.schemas.base_schema import BaseSchema
 
 LOGGER = logging.getLogger(__name__)
 
 
-class GraphForecaster(BaseGraphModule):
+class GraphForecaster(BaseRolloutGraphModule):
     """Graph neural network forecaster for PyTorch Lightning."""
 
     def __init__(
@@ -37,7 +32,6 @@ class GraphForecaster(BaseGraphModule):
         *,
         config: BaseSchema,
         graph_data: dict[str, HeteroData],
-        truncation_data: dict,
         statistics: dict,
         statistics_tendencies: dict,
         data_indices: dict[str, IndexCollection],
@@ -69,7 +63,6 @@ class GraphForecaster(BaseGraphModule):
         super().__init__(
             config=config,
             graph_data=graph_data,
-            truncation_data=truncation_data,
             statistics=statistics,
             statistics_tendencies=statistics_tendencies,
             data_indices=data_indices,
@@ -107,55 +100,6 @@ class GraphForecaster(BaseGraphModule):
             LOGGER.debug("Rollout window length: %d", self.rollout)
         self.rollout = min(self.rollout, self.rollout_max)
 
-    def on_after_batch_transfer(self, batch: dict, _: int) -> dict:
-        """Assemble batch after transfer to GPU by gathering the batch shards if needed.
-
-        Parameters
-        ----------
-        batch : dict
-            Dictionary batch to transfer
-
-        Returns
-        -------
-        dict
-            Batch after transfer
-        """
-        self.grid_shard_shapes = {}
-        self.grid_shard_slice = {}
-
-        for dataset_name in self.grid_indices:
-            if self.keep_batch_sharded and self.model_comm_group_size > 1:
-                self.grid_shard_shapes[dataset_name] = self.grid_indices[dataset_name].shard_shapes
-                self.grid_shard_slice[dataset_name] = self.grid_indices[dataset_name].get_shard_slice(
-                    self.reader_group_rank,
-                )
-            else:
-                self.grid_shard_shapes[dataset_name] = None
-                self.grid_shard_slice[dataset_name] = None
-                batch[dataset_name] = self.allgather_batch(
-                    batch[dataset_name],
-                    self.grid_indices[dataset_name],
-                    self.grid_dim,
-                )
-        return batch
-
-    def transfer_batch_to_device(
-        self,
-        batch: dict,
-        device: torch.device,
-        dataloader_idx: int = 0,
-    ) -> dict:
-        """Transfer batch to device, handling dictionary batches."""
-        # Multi-dataset dictionary batch
-        transferred_batch = {}
-        for dataset_name, dataset_batch in batch.items():
-            transferred_batch[dataset_name] = (
-                dataset_batch.to(device, non_blocking=True)
-                if isinstance(dataset_batch, torch.Tensor)
-                else dataset_batch
-            )
-        return transferred_batch
-
     def advance_input(
         self,
         x: torch.Tensor,
@@ -190,27 +134,21 @@ class GraphForecaster(BaseGraphModule):
         ]
         return x
 
-    def rollout_step(
+    def _rollout_step(
         self,
         batch: dict,
         rollout: int | None = None,
-        training_mode: bool = True,
         validation_mode: bool = False,
     ) -> Generator[tuple[torch.Tensor | None, dict, list]]:
         """Rollout step for the forecaster.
 
-        Will run pre_processors on batch, but not post_processors on predictions.
-
         Parameters
         ----------
         batch : dict
-            Dictionary batch to use for rollout
+            Dictionary batch to use for rollout (assumed to be already preprocessed)
         rollout : Optional[int], optional
             Number of times to rollout for, by default None
             If None, will use self.rollout
-        training_mode : bool, optional
-            Whether in training mode and to calculate the loss, by default True
-            If False, loss will be None
         validation_mode : bool, optional
             Whether in validation mode, and to calculate validation metrics, by default False
             If False, metrics will be empty
@@ -221,16 +159,6 @@ class GraphForecaster(BaseGraphModule):
             Loss value, metrics, and predictions (per step)
 
         """
-        for dataset_name in batch:
-            batch[dataset_name] = self.model.pre_processors[dataset_name](batch[dataset_name])  # normalized in-place
-
-        # Delayed scalers need to be initialized after the pre-processors once
-        if self.is_first_step:
-            self.update_scalers(callback=AvailableCallbacks.ON_TRAINING_START)
-            self.is_first_step = False
-
-        self.update_scalers(callback=AvailableCallbacks.ON_BATCH_START)
-
         # start rollout of preprocessed batch
         x = {}
         for dataset_name, dataset_batch in batch.items():
@@ -269,7 +197,6 @@ class GraphForecaster(BaseGraphModule):
                     y_pred[dataset_name],
                     y[dataset_name],
                     rollout_step,
-                    training_mode,
                     validation_mode,
                     dataset_name,
                     use_reentrant=False,
@@ -296,29 +223,3 @@ class GraphForecaster(BaseGraphModule):
             loss = total_loss
 
             yield loss, metrics_next, y_pred
-
-    def _step(
-        self,
-        batch: dict,
-        batch_idx: int,
-        validation_mode: bool = False,
-    ) -> tuple[torch.Tensor, Mapping[str, torch.Tensor]]:
-        del batch_idx
-
-        batch_dtype = next(iter(batch.values())).dtype
-        loss = torch.zeros(1, dtype=batch_dtype, device=self.device, requires_grad=False)
-        metrics = {}
-        y_preds = []
-
-        for loss_next, metrics_next, y_preds_next in self.rollout_step(
-            batch,
-            rollout=self.rollout,
-            training_mode=True,
-            validation_mode=validation_mode,
-        ):
-            loss += loss_next
-            metrics.update(metrics_next)
-            y_preds.append(y_preds_next)
-
-        loss *= 1.0 / self.rollout
-        return loss, metrics, y_preds
