@@ -25,10 +25,9 @@ from pydantic import field_validator
 from pydantic import model_validator
 from typing_extensions import Self
 
+from anemoi.training.schemas.schema_utils import DatasetDict
 from anemoi.utils.schemas import BaseModel
 from anemoi.utils.schemas.errors import allowed_values
-
-from anemoi.training.schemas.schema_utils import DatasetDict
 
 
 class GradientClip(BaseModel):
@@ -333,6 +332,7 @@ class DDPEnsGroupStrategyStrategySchema(BaseDDPStrategySchema):
 StrategySchemas = BaseDDPStrategySchema | DDPEnsGroupStrategyStrategySchema
 
 VariableGroupType = dict[str, str | list[str] | dict[str, str | bool | list[str | int]]]
+
 
 class BaseTrainingSchema(BaseModel):
     """Training configuration."""
