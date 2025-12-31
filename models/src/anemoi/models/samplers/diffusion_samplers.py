@@ -17,8 +17,13 @@ import torch
 from torch.distributed.distributed_c10d import ProcessGroup
 
 DenoisingFunction = Callable[
-    [dict[str, torch.Tensor], dict[str, torch.Tensor], torch.Tensor, Optional[ProcessGroup], dict[str, Optional[list]]],
-    dict[str, torch.Tensor],
+    [
+        dict[str,torch.Tensor],
+        dict[str,torch.Tensor],
+        torch.Tensor,
+        Optional[ProcessGroup], 
+        dict[str, Optional[list]]],
+        dict[str, torch.Tensor]
 ]
 
 
@@ -163,7 +168,7 @@ class DiffusionSampler(ABC):
         x : dict[str, torch.Tensor]
             Input conditioning data with shape (batch, time, ensemble, grid, vars)
         y : dict[str, torch.Tensor]
-            Initial noise tensor with shape (batch, time, ensemble, grid, vars)
+            Initial noise tensor with shape (batch, ensemble, grid, vars)
         sigmas : torch.Tensor
             Noise schedule with shape (num_steps + 1,)
         denoising_fn : Callable
@@ -178,7 +183,7 @@ class DiffusionSampler(ABC):
         Returns
         -------
         torch.Tensor
-            Sampled output with shape (batch, time, ensemble, grid, vars)
+            Sampled output with shape (batch, ensemble, grid, vars)
         """
         pass
 
@@ -212,7 +217,7 @@ class EDMHeunSampler(DiffusionSampler):
         model_comm_group: Optional[ProcessGroup] = None,
         grid_shard_shapes: dict[str, Optional[list]] = None,
         **kwargs,
-    ) -> dict[str, torch.Tensor]:
+    ) -> torch.Tensor:
         # Override instance defaults with any kwargs
         S_churn = kwargs.get("S_churn", self.S_churn)
         S_min = kwargs.get("S_min", self.S_min)
@@ -221,8 +226,8 @@ class EDMHeunSampler(DiffusionSampler):
         dtype = kwargs.get("dtype", self.dtype)
         eps_prec = kwargs.get("eps_prec", self.eps_prec)
 
-        y_shape = next(iter(y.values())).shape
-        batch_size, time_size, ensemble_size = y_shape[0], y_shape[1], y_shape[2]
+        x_shape = next(iter(x.values())).shape
+        batch_size, ensemble_size = x_shape[0], x_shape[2]
         num_steps = len(sigmas) - 1
 
         # Heun sampling loop
@@ -247,13 +252,10 @@ class EDMHeunSampler(DiffusionSampler):
             D1 = denoising_fn(
                 x,
                 y,
-                sigma_effective.view(1, 1, 1, 1, 1).expand(batch_size, time_size, ensemble_size, 1, 1).to(dtype),
+                sigma_effective.view(1, 1, 1, 1).expand(batch_size, ensemble_size, 1, 1).to(dtype),
                 model_comm_group,
                 grid_shard_shapes,
-            )
-
-            for dataset_name in D1:
-                D1[dataset_name] = D1[dataset_name].to(dtype)
+            ).to(dtype)
 
             d, y_next = {}, {}
             for dataset_name in y:
@@ -265,13 +267,10 @@ class EDMHeunSampler(DiffusionSampler):
                 D2 = denoising_fn(
                     x,
                     y_next,
-                    sigma_next.view(1, 1, 1, 1, 1).expand(batch_size, time_size, ensemble_size, 1, 1).to(dtype),
+                    sigma_next.view(1, 1, 1, 1).expand(batch_size, ensemble_size, 1, 1).to(dtype),
                     model_comm_group,
                     grid_shard_shapes,
-                )
-
-                for dataset_name in D2:
-                    D2[dataset_name] = D2[dataset_name].to(dtype)
+                ).to(dtype)
 
                 for dataset_name in y:
                     d_prime = (y_next[dataset_name] - D2[dataset_name]) / (sigma_next + eps_prec)
@@ -285,7 +284,11 @@ class EDMHeunSampler(DiffusionSampler):
 class DPMpp2MSampler(DiffusionSampler):
     """DPM++ 2M sampler (DPM-Solver++ with 2nd order multistep)."""
 
-    def __init__(self, dtype: torch.dtype = torch.float64, **kwargs):
+    def __init__(
+        self, 
+        dtype: torch.dtype = torch.float64,
+        **kwargs
+    ):
         self.dtype = dtype
         pass  # No parameters needed for DPM++ 2M
 
@@ -298,7 +301,7 @@ class DPMpp2MSampler(DiffusionSampler):
         model_comm_group: Optional[ProcessGroup] = None,
         grid_shard_shapes: dict[str, Optional[list]] = None,
         **kwargs,
-    ) -> dict[str, torch.Tensor]:
+    ) -> torch.Tensor:
         dtype = kwargs.get("dtype", self.dtype)
 
         # DPM++ sampler converts to x.dtype
@@ -306,8 +309,8 @@ class DPMpp2MSampler(DiffusionSampler):
             y[dataset_name] = y[dataset_name].to(x[dataset_name].dtype)
         sigmas = sigmas.to(dtype)
 
-        y_shape = next(iter(y.values())).shape
-        batch_size, time_size, ensemble_size = y_shape[0], y_shape[1], y_shape[2]
+        x_shape = next(iter(x.values())).shape
+        batch_size, ensemble_size = x_shape[0], x_shape[2]
         num_steps = len(sigmas) - 1
 
         # Storage for previous denoised predictions
@@ -318,7 +321,7 @@ class DPMpp2MSampler(DiffusionSampler):
             sigma = sigmas[i]
             sigma_next = sigmas[i + 1]
 
-            sigma_expanded = sigma.view(1, 1, 1, 1, 1).expand(batch_size, time_size, ensemble_size, 1, 1)
+            sigma_expanded = sigma.view(1, 1, 1, 1).expand(batch_size, ensemble_size, 1, 1)
             denoised = denoising_fn(x, y, sigma_expanded, model_comm_group, grid_shard_shapes)
 
             if sigma_next == 0:
