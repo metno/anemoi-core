@@ -68,7 +68,6 @@ class AnemoiDiffusionModelEncProcDec(BaseGraphModel):
 
     def _build_networks(self, model_config: DotDict) -> None:
         """Builds the model components."""
-
         # Encoder data -> hidden
         self.encoder_graph_provider = torch.nn.ModuleDict()
         self.encoder = torch.nn.ModuleDict()
