@@ -93,7 +93,7 @@ class AnemoiModelEncProcDec(BaseGraphModel):
                 in_channels_src=self.num_channels,
                 in_channels_dst=self.input_dim[dataset_name],
                 hidden_dim=self.num_channels,
-                out_channels_dst=self.num_output_channels[dataset_name],
+                out_channels_dst=self.output_dim[dataset_name],
                 edge_dim=self.decoder_graph_provider[dataset_name].edge_dim,
             )
 
@@ -109,7 +109,12 @@ class AnemoiModelEncProcDec(BaseGraphModel):
         node_attributes_data = self.node_attributes[dataset_name](self._graph_name_data, batch_size=batch_size)
         grid_shard_shapes = grid_shard_shapes[dataset_name] if grid_shard_shapes is not None else None
 
-        x_skip = self.residual[dataset_name](x, grid_shard_shapes=grid_shard_shapes, model_comm_group=model_comm_group)
+        x_skip = self.residual[dataset_name](
+            x,
+            grid_shard_shapes=grid_shard_shapes,
+            model_comm_group=model_comm_group,
+            n_step_output=self.n_step_output,
+        )
 
         if grid_shard_shapes is not None:
             shard_shapes_nodes = get_or_apply_shard_shapes(
@@ -143,9 +148,10 @@ class AnemoiModelEncProcDec(BaseGraphModel):
         x_out = (
             einops.rearrange(
                 x_out,
-                "(batch ensemble grid) vars -> batch ensemble grid vars",
+                "(batch ensemble grid) (time vars) -> batch time ensemble grid vars",
                 batch=batch_size,
                 ensemble=ensemble_size,
+                time=self.n_step_output,
             )
             .to(dtype=dtype)
             .clone()
@@ -153,6 +159,10 @@ class AnemoiModelEncProcDec(BaseGraphModel):
 
         # residual connection (just for the prognostic variables)
         assert dataset_name is not None, "dataset_name must be provided for multi-dataset case"
+        assert x_skip.ndim == 5, "Residual must be (batch, time, ensemble, grid, vars)."
+        assert (
+            x_skip.shape[1] == x_out.shape[1]
+        ), f"Residual time dimension ({x_skip.shape[1]}) must match output time dimension ({x_out.shape[1]})."
         x_out[..., self._internal_output_idx[dataset_name]] += x_skip[..., self._internal_input_idx[dataset_name]]
 
         for bounding in self.boundings[dataset_name]:
@@ -206,20 +216,10 @@ class AnemoiModelEncProcDec(BaseGraphModel):
         """
         dataset_names = list(x.keys())
 
-        # Extract and validate batch sizes across datasets
-        batch_sizes = [x[dataset_name].shape[0] for dataset_name in dataset_names]
-        ensemble_sizes = [x[dataset_name].shape[2] for dataset_name in dataset_names]
+        # Extract and validate batch & ensemble sizes across datasets
+        batch_size = self._get_consistent_dim(x, 0)
+        ensemble_size = self._get_consistent_dim(x, 2)
 
-        # Assert all datasets have the same batch and ensemble sizes
-        assert all(
-            bs == batch_sizes[0] for bs in batch_sizes
-        ), f"Batch sizes must be the same across datasets: {batch_sizes}"
-        assert all(
-            es == ensemble_sizes[0] for es in ensemble_sizes
-        ), f"Ensemble sizes must be the same across datasets: {ensemble_sizes}"
-
-        batch_size = batch_sizes[0]
-        ensemble_size = ensemble_sizes[0]
         in_out_sharded = grid_shard_shapes is not None
         self._assert_valid_sharding(batch_size, ensemble_size, in_out_sharded, model_comm_group)
 
@@ -325,15 +325,15 @@ class AnemoiModelEncProcDec(BaseGraphModel):
         for dataset in self.input_dim.keys():
             shapes = {
                 "variables": self.input_dim[dataset],
-                "input_timesteps": self.multi_step,
+                "input_timesteps": self.n_step_input,
                 "ensemble": 1,
                 "grid": None,  # grid size is dynamic
             }
             md_dict["metadata_inference"][dataset]["shapes"] = shapes
 
             rel_date_indices = md_dict["metadata_inference"][dataset]["timesteps"]["relative_date_indices_training"]
-            input_rel_date_indices = rel_date_indices[:-1]
-            output_rel_date_indices = rel_date_indices[-1]
+            input_rel_date_indices = rel_date_indices[: self.n_step_input]
+            output_rel_date_indices = rel_date_indices[-self.n_step_output :]
             md_dict["metadata_inference"][dataset]["timesteps"]["input_relative_date_indices"] = input_rel_date_indices
             md_dict["metadata_inference"][dataset]["timesteps"][
                 "output_relative_date_indices"
