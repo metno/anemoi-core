@@ -23,6 +23,9 @@ LOGGER = logging.getLogger(__name__)
 class SpectralTransform(torch.nn.Module):
     """Abstract base class for spectral transforms."""
 
+    def __init__(self) -> None:
+        super().__init__()
+
     @abc.abstractmethod
     def forward(
         self,
@@ -62,6 +65,7 @@ class FFT2D(SpectralTransform):
         y_dim : int
             size of the spatial dimension y of the original data in 2D
         """
+        super().__init__()
         self.x_dim = x_dim
         self.y_dim = y_dim
         self.nodes_slice = slice(*nodes_slice)
