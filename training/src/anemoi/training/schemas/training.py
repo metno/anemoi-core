@@ -261,6 +261,9 @@ class ImplementedLossesUsingBaseLossSchema(str, Enum):
     combined = "anemoi.training.losses.combined.CombinedLoss"
     fcl = "anemoi.training.losses.spectral.FourierCorrelationLoss"
     lsd = "anemoi.training.losses.spectral.LogSpectralDistance"
+    logfft2d = "anemoi.training.losses.spectral.LogFFT2Distance"
+    spectral_crps = "anemoi.training.losses.spectral.SpectralCRPSLoss"
+    spectral_l2 = "anemoi.training.losses.spectral.SpectralL2Loss"
 
 
 class BaseLossSchema(BaseModel):
@@ -309,7 +312,7 @@ class HuberLossSchema(BaseLossSchema):
 class SpectralLossSchema(BaseLossSchema):
     """Spectral loss class."""
 
-    transform: Literal["fft2d", "sht"] = Field(..., example="fft2d")
+    transform: Literal["fft2d", "dct2d", "sht"] = Field(..., example="fft2d")
     """Type of spectral transform to use."""
 
     class Config(BaseModel.Config):
@@ -354,7 +357,6 @@ LossSchemas = (
     | KernelCRPSSchema
     | SpectralLossSchema
     | MultiScaleLossSchema
-    | None
 )
 
 
@@ -485,15 +487,6 @@ class DiffusionTendForecasterSchema(ForecasterSchema):
     "Training objective."
 
 
-class InterpolationSchema(BaseTrainingSchema):
-    model_task: Literal["anemoi.training.train.tasks.GraphInterpolator"] = Field(..., alias="model_task")
-    "Training objective."
-    explicit_times: ExplicitTimes
-    "Time indices for input and output."
-    target_forcing: DatasetDict[TargetForcing]
-    "Forcing parameters for target output times."
-
-
 class AutoencoderSchema(ForecasterSchema):
     model_task: Literal["anemoi.training.train.tasks.GraphAutoEncoder",] = Field(..., alias="model_task")
     "Training objective."
@@ -504,14 +497,11 @@ class InterpolationMultiSchema(BaseTrainingSchema):
     "Training objective."
     explicit_times: ExplicitTimes
     "Time indices for input and output."
-    target_forcing: None
-    "Forcing parameters not applied for multi-outputs."
 
 
 TrainingSchema = Annotated[
     ForecasterSchema
     | ForecasterEnsSchema
-    | InterpolationSchema
     | InterpolationMultiSchema
     | DiffusionForecasterSchema
     | DiffusionTendForecasterSchema

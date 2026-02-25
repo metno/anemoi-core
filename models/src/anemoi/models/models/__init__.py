@@ -11,7 +11,6 @@ from .base import BaseGraphModel
 from .encoder_processor_decoder import AnemoiModelEncProcDec
 from .ens_encoder_processor_decoder import AnemoiEnsModelEncProcDec
 from .hierarchical import AnemoiModelEncProcDecHierarchical
-from .interpolator import AnemoiModelEncProcDecInterpolator
 from .interpolator import AnemoiModelEncProcDecMultiOutInterpolator
 from .obsinterpolator import Nowcaster
 
@@ -27,7 +26,6 @@ __all__ = [
     "AnemoiDiffusionModelEncProcDec",
     "AnemoiDiffusionTendModelEncProcDec",
     "AnemoiModelEncProcDecHierarchical",
-    "AnemoiModelEncProcDecInterpolator",
     "AnemoiEnsModelEncProcDec",
     "AnemoiModelAutoEncoder",
     "AnemoiModelHierarchicalAutoEncoder",
