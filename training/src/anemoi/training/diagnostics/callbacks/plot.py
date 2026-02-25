@@ -272,9 +272,8 @@ class BasePerBatchPlotCallback(BasePlotCallback):
             }
             # output: (loss, [pred_dict1, pred_dict2, ...]); all tasks return a list of per-step dicts.
             preds = output[1]
-            if not isinstance(preds, list):
-
-                raise TypeError(preds)
+            if isinstance(preds, dict):
+                preds = [preds]
             output = [
                 output[0],
                 [
@@ -306,7 +305,6 @@ class BasePerBatchPlotCallback(BasePlotCallback):
                 batch,
                 batch_idx,
                 epoch=trainer.current_epoch,
-                output_times=pl_module.output_times,
                 output_times=pl_module.output_times,
                 **kwargs,
             )
@@ -348,7 +346,6 @@ class BasePerEpochPlotCallback(BasePlotCallback):
                 pl_module,
                 self.dataset_names,
                 epoch=trainer.current_epoch,
-                output_times=pl_module.output_times,
                 output_times=pl_module.output_times,
                 **kwargs,
             )
@@ -676,19 +673,40 @@ class LongRolloutPlots(BasePlotCallback):
         self,
         trainer: pl.Trainer,
         pl_module: pl.LightningModule,
-        output: list[torch.Tensor],
-        batch: torch.Tensor,
+        output: list[dict[str,torch.Tensor]],
+        batch: dict[str, torch.Tensor],
         batch_idx: int,
     ) -> None:
         if (batch_idx) == 0 and (trainer.current_epoch + 1) % self.every_n_epochs == 0:
-            batch = pl_module.allgather_batch(batch)
-            output = [output[0], [pl_module.allgather_batch(pred) for pred in output[1]]]
+            batch = {
+                dataset_name: pl_module.allgather_batch(dataset_tensor, dataset_name)
+                for dataset_name, dataset_tensor in batch.items()
+            }
+            preds = output[1]
+            context = next(iter(batch.values())).device  # get device from any of the tensors in the batch
+            if not isinstance(preds, list):
 
+                raise TypeError(preds)
+
+            output = [
+                output[0],
+                [
+                    {
+                        dataset_name: pl_module.allgather_batch(dataset_pred, dataset_name)
+                        for dataset_name, dataset_pred in pred.items()
+                    }
+                    for pred in preds
+                ],
+            ]
             self.post_processors = copy.deepcopy(pl_module.model.post_processors)
-            for post_processor in self.post_processors.processors.values():
-                if hasattr(post_processor, "nan_locations"):
-                    post_processor.nan_locations = pl_module.allgather_batch(post_processor.nan_locations)
-            self.post_processors = self.post_processors.cpu()
+            for dataset_name in self.post_processors:
+                for post_processor in self.post_processors[dataset_name].processors.values():
+                    if hasattr(post_processor, "nan_locations"):
+                        post_processor.nan_locations = pl_module.allgather_batch(
+                            post_processor.nan_locations,
+                            dataset_name,
+                        )
+                self.post_processors[dataset_name] = self.post_processors[dataset_name].cpu()
 
             precision_mapping = {
                 "16-mixed": torch.float16,
@@ -696,7 +714,6 @@ class LongRolloutPlots(BasePlotCallback):
             }
             prec = trainer.precision
             dtype = precision_mapping.get(prec)
-            context = torch.autocast(device_type=batch.device.type, dtype=dtype) if dtype is not None else nullcontext()
 
             if self.config.diagnostics.plot.asynchronous:
                 LOGGER.warning("Asynchronous plotting not supported for long rollout plots.")
@@ -981,7 +998,6 @@ class PlotLoss(BasePerBatchPlotCallback):
         batch_idx: int,
         epoch: int,
         output_times: int,
-        output_times: int,
     ) -> None:
         logger = trainer.logger
         _ = batch_idx
@@ -1014,10 +1030,7 @@ class PlotLoss(BasePerBatchPlotCallback):
 
             if pl_module.task_type != "forecaster":
                 output_times = 1
-            if pl_module.task_type != "forecaster":
-                output_times = 1
 
-            for rollout_step in range(output_times):
             for rollout_step in range(output_times):
                 y_hat = outputs[1][rollout_step][dataset_name]
                 start = pl_module.n_step_input + rollout_step * pl_module.n_step_output
@@ -1101,7 +1114,6 @@ class BasePlotAdditionalMetrics(BasePerBatchPlotCallback):
         outputs: tuple[torch.Tensor, list[dict[str, torch.Tensor]]],
         batch: dict[str, torch.Tensor],
         output_times: int,
-        output_times: int,
     ) -> tuple[np.ndarray, np.ndarray]:
         """Process the data and output tensors for plotting one dataset specified by dataset_name.
 
@@ -1174,9 +1186,6 @@ class BasePlotAdditionalMetrics(BasePerBatchPlotCallback):
         # total_targets: forecaster has n_step_output per rollout step; interpolator has 1 per step
         total_targets = output_times
         if pl_module.task_type == "forecaster":
-        # total_targets: forecaster has n_step_output per rollout step; interpolator has 1 per step
-        total_targets = output_times
-        if pl_module.task_type == "forecaster":
             total_targets *= pl_module.n_step_output
 
         input_tensor = (
@@ -1198,8 +1207,6 @@ class BasePlotAdditionalMetrics(BasePerBatchPlotCallback):
                 for x in outputs[1]
             ),
         )
-
-        if pl_module.task_type == "time-interpolator" and output_tensor.ndim == 5 and output_tensor.shape[0] == 1:
 
         if pl_module.task_type == "time-interpolator" and output_tensor.ndim == 5 and output_tensor.shape[0] == 1:
             # Multi-out interpolator: rollouts are packed in the time dimension.
@@ -1285,7 +1292,6 @@ class PlotSample(BasePlotAdditionalMetrics):
         batch_idx: int,
         epoch: int,
         output_times: int,
-        output_times: int,
     ) -> None:
         logger = trainer.logger
 
@@ -1317,10 +1323,7 @@ class PlotSample(BasePlotAdditionalMetrics):
             )
 
             if pl_module.task_type == "forecaster" and output_tensor.ndim == 5 and output_tensor.shape[0] == 1:
-            if pl_module.task_type == "forecaster" and output_tensor.ndim == 5 and output_tensor.shape[0] == 1:
                 max_out_steps = min(pl_module.n_step_output, self.output_steps)
-                for rollout_step in range(output_times):
-                    init_step = pl_module.get_init_step(rollout_step)
                 for rollout_step in range(output_times):
                     init_step = pl_module.get_init_step(rollout_step)
                     for out_step in range(max_out_steps):
@@ -1355,9 +1358,7 @@ class PlotSample(BasePlotAdditionalMetrics):
                         )
             else:
                 for rollout_step in range(output_times):
-                for rollout_step in range(output_times):
                     interp_step = rollout_step + 1
-                    init_step = pl_module.get_init_step(rollout_step)
                     init_step = pl_module.get_init_step(rollout_step)
                     fig = plot_predicted_multilevel_flat_sample(
                         plot_parameters_dict,
@@ -1432,7 +1433,6 @@ class PlotSpectrum(BasePlotAdditionalMetrics):
         batch_idx: int,
         epoch: int,
         output_times: int,
-        output_times: int,
     ) -> None:
         logger = trainer.logger
 
@@ -1466,10 +1466,7 @@ class PlotSpectrum(BasePlotAdditionalMetrics):
             }
 
             if pl_module.task_type == "forecaster":
-            if pl_module.task_type == "forecaster":
                 max_out_steps = min(pl_module.n_step_output, self.output_steps)
-                for rollout_step in range(output_times):
-                    init_step = pl_module.get_init_step(rollout_step)
                 for rollout_step in range(output_times):
                     init_step = pl_module.get_init_step(rollout_step)
                     for out_step in range(max_out_steps):
@@ -1499,8 +1496,6 @@ class PlotSpectrum(BasePlotAdditionalMetrics):
                             ),
                         )
             else:
-                for rollout_step in range(output_times):
-                    init_step = pl_module.get_init_step(rollout_step)
                 for rollout_step in range(output_times):
                     init_step = pl_module.get_init_step(rollout_step)
                     interp_step = rollout_step + 1
@@ -1581,7 +1576,6 @@ class PlotHistogram(BasePlotAdditionalMetrics):
         batch_idx: int,
         epoch: int,
         output_times: int,
-        output_times: int,
     ) -> None:
         logger = trainer.logger
 
@@ -1614,10 +1608,7 @@ class PlotHistogram(BasePlotAdditionalMetrics):
             }
 
             if pl_module.task_type == "forecaster":
-            if pl_module.task_type == "forecaster":
                 max_out_steps = min(pl_module.n_step_output, self.output_steps)
-                for rollout_step in range(output_times):
-                    init_step = pl_module.get_init_step(rollout_step)
                 for rollout_step in range(output_times):
                     init_step = pl_module.get_init_step(rollout_step)
                     for out_step in range(max_out_steps):
@@ -1647,8 +1638,6 @@ class PlotHistogram(BasePlotAdditionalMetrics):
                             ),
                         )
             else:
-                for rollout_step in range(output_times):
-                    init_step = pl_module.get_init_step(rollout_step)
                 for rollout_step in range(output_times):
                     init_step = pl_module.get_init_step(rollout_step)
                     interp_step = rollout_step + 1
