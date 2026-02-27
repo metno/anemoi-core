@@ -12,7 +12,7 @@ from .encoder_processor_decoder import AnemoiModelEncProcDec
 from .ens_encoder_processor_decoder import AnemoiEnsModelEncProcDec
 from .hierarchical import AnemoiModelEncProcDecHierarchical
 from .interpolator import AnemoiModelEncProcDecMultiOutInterpolator
-from .obsinterpolator import Nowcaster
+from .nowcaster import Nowcaster
 
 from .autoencoder import AnemoiModelAutoEncoder  # isort: skip
 from .hierarchical_autoencoder import AnemoiModelHierarchicalAutoEncoder  # isort: skip

@@ -296,7 +296,6 @@ class BaseGraphModule(pl.LightningModule, ABC):
         self.shard_shapes, self.grid_sizes = {}, {}
         for dataset_name in self.dataset_names:
             self.grid_sizes[dataset_name] = graph_data[dataset_name].num_nodes
-            print("GRID SIZES", self.grid_sizes, flush=True)
             self.shard_shapes[dataset_name] = get_balanced_partition_sizes(
                 self.grid_sizes[dataset_name],
                 reader_group_size,
@@ -456,12 +455,29 @@ class BaseGraphModule(pl.LightningModule, ABC):
         if scaler is None:  # If scalar is None, no update to be applied
             return
 
-        if name in loss_obj.scaler:  # If scalar in loss, update it
+        if self._can_update_scaler(loss_obj, name):
             loss_obj.update_scaler(scaler=scaler[1], name=name)  # Only update the values
 
         for metric in metrics_dict.values():  # If scalar in metrics, update it
-            if name in metric.scaler:
+            if self._can_update_scaler(metric, name):
                 metric.update_scaler(scaler=scaler[1], name=name)  # Only update the values
+
+    @staticmethod
+    def _can_update_scaler(loss_or_metric: torch.nn.Module, scaler_name: str) -> bool:
+        """Whether a module can update a scaler with this name.
+
+        Standard losses/metrics expose a ``scaler`` container, while composite losses
+        (e.g., ``CombinedLoss``) intentionally remove this attribute and route updates
+        through their ``update_scaler`` implementation.
+        """
+        if not hasattr(loss_or_metric, "update_scaler"):
+            return False
+
+        scaler = getattr(loss_or_metric, "scaler", None)
+        if scaler is None:
+            return True
+
+        return scaler_name in scaler
 
     def update_scalers(self, callback: AvailableCallbacks) -> None:
         """Update scalers, calling the defined function on them, updating if not None."""

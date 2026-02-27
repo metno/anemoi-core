@@ -8,6 +8,7 @@ from omegaconf import DictConfig
 
 from anemoi.models.data_indices.collection import IndexCollection
 from anemoi.models.preprocessing import Processors
+from anemoi.training.losses.scalers.base_scaler import AvailableCallbacks
 from anemoi.training.train.tasks.base import BaseGraphModule
 from anemoi.training.train.tasks.diffusionforecaster import GraphDiffusionForecaster
 from anemoi.training.train.tasks.ensforecaster import GraphEnsForecaster
@@ -21,6 +22,37 @@ class DummyLoss(torch.nn.Module):
     def forward(self, y_pred: torch.Tensor, y: torch.Tensor, **kwargs) -> torch.Tensor:
         del kwargs
         return torch.mean((y_pred - y) ** 2)
+
+
+class DummyCompositeLoss(torch.nn.Module):
+    """CombinedLoss-like object: supports update_scaler but has no .scaler attribute."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.updated: list[str] = []
+
+    def update_scaler(self, name: str, scaler: torch.Tensor, *, override: bool = False) -> None:
+        del scaler, override
+        self.updated.append(name)
+
+
+class DummyScalerBuilder:
+
+    def update_scaling_values(self, callback: AvailableCallbacks, **kwargs):
+        del callback, kwargs
+        return ((), torch.tensor([1.0]))
+
+
+class DummyMetricWithScaler(torch.nn.Module):
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.scaler = {"nan_mask_weights": torch.tensor([1.0])}
+        self.updated: list[str] = []
+
+    def update_scaler(self, name: str, scaler: torch.Tensor, *, override: bool = False) -> None:
+        del scaler, override
+        self.updated.append(name)
 
 
 class DummyModel:
@@ -371,6 +403,28 @@ def test_rollout_advance_input_keeps_latest_steps(
     assert kept_steps == expected_next_input, error_msg
     for idx, value in enumerate(expected):
         assert torch.all(updated[:, idx] == value)
+
+
+def test_update_scaler_for_dataset_accepts_composite_loss_without_scaler() -> None:
+    """Composite losses (e.g. CombinedLoss) can update scalers even without a `.scaler` attr."""
+    task = GraphForecaster.__new__(GraphForecaster)
+    pl.LightningModule.__init__(task)
+    task.model = DummyModel()
+
+    loss_obj = DummyCompositeLoss()
+    metric = DummyMetricWithScaler()
+
+    task._update_scaler_for_dataset(
+        name="nan_mask_weights",
+        scaler_builder=DummyScalerBuilder(),
+        callback=AvailableCallbacks.ON_BATCH_START,
+        loss_obj=loss_obj,
+        metrics_dict={"metric": metric},
+        dataset_name="data",
+    )
+
+    assert loss_obj.updated == ["nan_mask_weights"]
+    assert metric.updated == ["nan_mask_weights"]
 
 
 # Minimal index stub for interpolator output_times tests (no full IndexCollection).
