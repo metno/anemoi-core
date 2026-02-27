@@ -405,6 +405,7 @@ def plot_predicted_multilevel_flat_sample(
     datashader: bool = False,
     precip_and_related_fields: list | None = None,
     colormaps: dict[str, Colormap] | None = None,
+    dpi: int = 100,
 ) -> Figure:
     """Plots data for one multilevel latlon-"flat" sample.
 
@@ -443,7 +444,7 @@ def plot_predicted_multilevel_flat_sample(
     n_plots_x, n_plots_y = len(parameters), n_plots_per_sample
 
     figsize = (n_plots_y * 4, n_plots_x * 3)
-    fig, axs = plt.subplots(n_plots_x, n_plots_y, figsize=figsize, layout=LAYOUT)
+    fig, axs = plt.subplots(n_plots_x, n_plots_y, figsize=figsize, dpi=dpi, layout=LAYOUT)
 
     pc_lat, pc_lon = equirectangular_projection(latlons)
     if colormaps is None:
@@ -672,10 +673,10 @@ def single_plot(
 
     else:
         df = pd.DataFrame({"val": data, "x": lon, "y": lat})
-        # Adjust binning to match the resolution of the data
-        lower_limit = 25
-        upper_limit = 500
-        n_pixels = max(min(int(np.floor(data.shape[0] * 0.004)), upper_limit), lower_limit)
+        # Use a higher datashader raster size to reduce visible blur on wide multi-panel plots.
+        lower_limit = 50
+        upper_limit = 1000
+        n_pixels = max(min(int(np.floor(data.shape[0] * 0.006)), upper_limit), lower_limit)
         psc = dsshow(
             df,
             dsh.Point("x", "y"),

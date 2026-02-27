@@ -1437,6 +1437,7 @@ class MultiStepPlot(BasePlotAdditionalMetrics):
         video: bool = True,
         animation_interval: int = 350,
         video_fps: int = 8,
+        frame_dpi: int = 140,
         save_frames: bool = False,
         max_steps: int | None = None,
         **kwargs: Any,
@@ -1452,6 +1453,7 @@ class MultiStepPlot(BasePlotAdditionalMetrics):
         self.video = video
         self.animation_interval = animation_interval
         self.video_fps = video_fps
+        self.frame_dpi = frame_dpi
         self.save_frames = save_frames
         self.max_steps = max_steps if max_steps is not None else output_steps
 
@@ -1529,6 +1531,7 @@ class MultiStepPlot(BasePlotAdditionalMetrics):
                     datashader=self.datashader_plotting,
                     precip_and_related_fields=self.precip_and_related_fields,
                     colormaps=self.colormaps,
+                    dpi=self.frame_dpi,
                 )
 
                 if self.save_frames:
@@ -1554,10 +1557,12 @@ class MultiStepPlot(BasePlotAdditionalMetrics):
                     plt.close(fig_step)
 
             if self.video and frame_images:
-                fig_anim, ax = plt.subplots(figsize=(10, 6), dpi=72)
+                frame_h, frame_w = frame_images[0].shape[:2]
+                dpi = self.frame_dpi
+                fig_anim, ax = plt.subplots(figsize=(frame_w / dpi, frame_h / dpi), dpi=dpi)
                 ax.axis("off")
-                im = ax.imshow(frame_images[0], animated=True)
-                ax.set_title(f"{dataset_name}: multistep prediction ({n_steps} steps)")
+                ax.set_position([0.0, 0.0, 1.0, 1.0])
+                im = ax.imshow(frame_images[0], animated=True, aspect="auto", interpolation="nearest")
 
                 def _update(frame_id: int):
                     im.set_data(frame_images[frame_id])
