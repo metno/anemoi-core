@@ -1,13 +1,9 @@
----
 defaults:
   - plot: downscaling
+  # TODO: figure out if we need callbacks
   - callbacks: placeholder
   - benchmark_profiler: detailed
   - log: mlflow
-
-# another alternative if you don't have any callbacks is to remove it from the
-# defaults list and just use
-# callbacks: []
 
 debug:
   # this will detect and trace back NaNs / Infs etc. but will slow down training
@@ -30,3 +26,4 @@ checkpoint:
 enable_progress_bar: True
 check_val_every_n_epoch: 1
 print_memory_summary: False
+

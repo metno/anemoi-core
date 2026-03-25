@@ -1,10 +1,18 @@
 datasets:
   era: null
-  
+
   carra:
     general_variable:
       _target_: anemoi.training.losses.scalers.GeneralVariableLossScaler
+      # TODO: set based on global
       weights: null
+
+    node_scaler:
+      _target_: anemoi.training.losses.scalers.GraphNodeAttributeScaler
+      nodes_name: ${graph.carra}
+      nodes_attribute_name: area_weight
+      norm: unit-sum
 
   nan_mask_weight:
     _target_: anemoi.training.losses.scalers.NaNMaskScaler
+

@@ -1,12 +1,10 @@
 defaults:
-- data: downscaling
-- dataloader: downscaling
-- diagnostics: downscaling
-- system: slurm
-- graph: lam_downscaling
-- model: graphtransformer_ens
-- training: downscaling
+  - data: downscaling
+  - dataloader: downscaling
+  - diagnostics: downscaling
+  - system: slurm
+  - graph: lam_downscaling
+  - model: downscaling
+  - training: downscaling
 
 config_validation: True
-
-

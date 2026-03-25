@@ -7,29 +7,137 @@ timestep: 3h
 
 datasets:
   era:
-    forcing: #ALL
+    forcing:
+      - 100u
+      - 100v
+      - 10u
+      - 10v
+      - 2d
+      - 2t
+      - cp
+      - hcc
+      - lcc
+      - mcc
+      - msl
+      - q_1000
+      - q_925
+      - q_850
+      - q_700
+      - q_600
+      - q_500
+      - ro
+      - sdor
+      - sf
+      - skt
+      - slor
+      - sp
+      - ssrd
+      - stl1
+      - stl2
+      - strd
+      - swvl1
+      - swvl2
+      - t_1000
+      - t_925
+      - t_850
+      - t_700
+      - t_600
+      - t_500
+      - tcc
+      - tcw
+      - tp
+      - u_1000
+      - u_925
+      - u_850
+      - u_700
+      - u_600
+      - u_500
+      - v_1000
+      - v_925
+      - v_850
+      - v_700
+      - v_600
+      - v_500
+      - w_1000
+      - w_925
+      - w_850
+      - w_700
+      - w_600
+      - w_500
+      - z_1000
+      - z_925
+      - z_850
+      - z_700
+      - z_600
+      - z_500
     diagnostic: []
     processors:
       normalizer:
         _target_: anemoi.models.preprocessing.normalizer.InputNormalizer
         config:
-          default: "mean-std"
+          default: mean-std
           std:
           min-max:
           max:
+            - z_1000
+            - z_925
+            - z_850
+            - z_700
+            - z_600
+            - z_500
           none:
-    
+            - hcc
+            - lcc
+            - mcc
+            - tcc
+
   carra:
     forcing: #Static forcings
-    diagnostic: #Output
+      - cos_latitude
+      - cos_longitude
+      - sin_latitude
+      - sin_longitude
+      - cos_julian_day
+      - cos_local_time
+      - sin_julian_day
+      - sin_local_time
+      - insolation
+      - lsm
+      - orog
+
+    diagnostic:
+      - 2t # 2m temperature
+      - tp # total precipitation
+      - 10u # 10m wind component
+      - 10v # 10m wind component
+      - sp # surface pressure
+      - 2d # dew point temperature
+      - tcc # total cloud coverage
+      - 100u # 100m wind component
+      - 100v # 100m wind component
+      - mn2t # min 2t temperature
+      - mx2t # max 2t temperature
+
     processors:
       normalizer:
         _target_: anemoi.models.preprocessing.normalizer.InputNormalizer
         config:
-          default: "mean-std"
+          default: mean-std
           std:
           min-max:
           max:
+            - orog
           none:
+            - cos_latitude
+            - cos_longitude
+            - sin_latitude
+            - sin_longitude
+            - cos_julian_day
+            - cos_local_time
+            - sin_julian_day
+            - sin_local_time
+            - insolation
+            - lsm
+            - tcc
 
 num_features: null

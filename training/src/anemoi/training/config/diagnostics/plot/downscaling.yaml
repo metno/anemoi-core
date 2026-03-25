@@ -1,15 +1,13 @@
 asynchronous: True # Whether to plot asynchronously
-projection_kind: equirectangular  # or lambert_conformal (requires cartopy)
+projection_kind: equirectangular # or lambert_conformal (requires cartopy)
 datashader: True # Choose which technique to use for plotting
 frequency: # Frequency of the plotting
   batch: 750
   epoch: 5
 
-
 datasets_to_plot: ["carra"]
 sample_idx: 0
 precip_and_related_fields: [tp, cp]
-
 
 callbacks:
   - _target_: anemoi.training.diagnostics.callbacks.plot.PlotLoss
@@ -27,4 +25,5 @@ callbacks:
     output_steps: ${training.multistep_output}
     every_n_batches: ${diagnostics.plot.frequency.batch}
     precip_and_related_fields: ${diagnostics.plot.precip_and_related_fields}
-    parameters: #TODO
+    # TODO:
+    parameters:

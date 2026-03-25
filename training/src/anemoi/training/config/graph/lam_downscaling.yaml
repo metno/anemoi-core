@@ -1,8 +1,9 @@
+name: core-graph
 overwrite: True
 
 nodes:
-  low_res:
-    era:
+  era:
+    node_builder:
       _target_: anemoi.graphs.nodes.AnemoiDatasetNodes
       dataset: ${dataloader.training.datasets.era.dataset_config}
     attributes: ${graph.attributes.nodes}
@@ -15,52 +16,57 @@ nodes:
     node_builder:
       _target_: anemoi.graphs.nodes.TriNodes # options: AnemoiDatasetNodes, NPZFileNodes, TriNodes
       resolution: 10
-      reference_node_name: "era"
+      # TODO: we are using carra in the diffusion version, should this be carra?
+      reference_node_name: carra
+      # Prevents having isolated hidden nodes if using carra as reference
+      margin_radius_km: 2.5
 
 edges:
-- source_name: "era"
-  target_name: "hidden"
-  edge_builders:
-  - _target_: anemoi.graphs.edges.CutOffEdges # options: KNNEdges, CutOffEdges
-    cutoff_factor: 0.6 # only for cutoff method
-    source_mask_attr_name: null
-    target_mask_attr_name: null
+  - source_name: era
+    target_name: hidden
+    edge_builders:
+      # TODO: we are using KNNEdges with 3 neighbors in the diffusion version
+      - _target_: anemoi.graphs.edges.CutOffEdges # options: KNNEdges, CutOffEdges
+        cutoff_factor: 0.6 # only for cutoff method
+        source_mask_attr_name: null
+        target_mask_attr_name: null
 
-- source_name: "carra"
-  target_name: "hidden"
-  edge_builders:
-  - _target_: anemoi.graphs.edges.CutOffEdges # options: KNNEdges, CutOffEdges
-    cutoff_factor: 0.6 # only for cutoff method
-    source_mask_attr_name: null
-    target_mask_attr_name: null
-  
-- source_name: "hidden"
-  target_name: "hidden"
-  edge_builders:
-  - _target_: anemoi.graphs.edges.MultiScaleEdges
-    x_hops: 1
-    scale_resolutions: ${graph.nodes.hidden.node_builder.resolution}
-    source_mask_attr_name: null
-    target_mask_attr_name: null
-  attributes: ${graph.attributes.edges}
+  - source_name: carra
+    target_name: hidden
+    edge_builders:
+      - _target_: anemoi.graphs.edges.CutOffEdges # options: KNNEdges, CutOffEdges
+        cutoff_factor: 0.6 # only for cutoff method
+        source_mask_attr_name: null
+        target_mask_attr_name: null
 
-- source_name: "hidden" #TODO: think we need this for technical reasons
-  target_name: "era"
-  edge_builders:
-  - _target_: anemoi.graphs.edges.KNNEdges # options: KNNEdges, CutOffEdges
-    num_nearest_neighbours: 3 # only for knn method
-    source_mask_attr_name: null
-    target_mask_attr_name: null
-  attributes: ${graph.attributes.edges}
+  - source_name: hidden
+    target_name: hidden
+    edge_builders:
+      - _target_: anemoi.graphs.edges.MultiScaleEdges
+        x_hops: 1
+        scale_resolutions: ${graph.nodes.hidden.node_builder.resolution}
+        source_mask_attr_name: null
+        target_mask_attr_name: null
+    attributes: ${graph.attributes.edges}
 
-- source_name: "hidden"
-  target_name: "carra"
-  edge_builders:
-  - _target_: anemoi.graphs.edges.KNNEdges # options: KNNEdges, CutOffEdges
-    num_nearest_neighbours: 3 # only for knn method
-    source_mask_attr_name: null
-    target_mask_attr_name: null
-  attributes: ${graph.attributes.edges}
+  # NOTE: think we need these edges for technical reasons
+  - source_name: hidden
+    target_name: era
+    edge_builders:
+      - _target_: anemoi.graphs.edges.KNNEdges # options: KNNEdges, CutOffEdges
+        num_nearest_neighbours: 3 # only for knn method
+        source_mask_attr_name: null
+        target_mask_attr_name: null
+    attributes: ${graph.attributes.edges}
+
+  - source_name: hidden
+    target_name: carra
+    edge_builders:
+      - _target_: anemoi.graphs.edges.KNNEdges # options: KNNEdges, CutOffEdges
+        num_nearest_neighbours: 3 # only for knn method
+        source_mask_attr_name: null
+        target_mask_attr_name: null
+    attributes: ${graph.attributes.edges}
 
 attributes:
   nodes:
@@ -74,4 +80,3 @@ attributes:
     edge_dirs:
       _target_: anemoi.graphs.edges.attributes.EdgeDirection
       norm: unit-max
-
