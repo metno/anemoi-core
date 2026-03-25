@@ -1,0 +1,10 @@
+datasets:
+  era: null
+  
+  carra:
+    general_variable:
+      _target_: anemoi.training.losses.scalers.GeneralVariableLossScaler
+      weights: null
+
+  nan_mask_weight:
+    _target_: anemoi.training.losses.scalers.NaNMaskScaler
