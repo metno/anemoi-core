@@ -1,5 +1,5 @@
 dataset:
-graph: ${system.scratch}/graphs/carra-east/main-core.pt
+graph: ${scratch}/graphs/carra-east/main-core.pt
 # To load the graph from a file, you need to provide a path here like: /path/to/your/graph.pt
 # If no such file exists, the graph will be created from the config.
 truncation: null

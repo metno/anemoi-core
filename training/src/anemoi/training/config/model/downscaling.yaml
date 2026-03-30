@@ -155,7 +155,7 @@ bounding: #These are applied in order
       - tp
 
   - _target_: anemoi.models.layers.bounding.HardtanhBounding
-    variable:
+    variables:
       - tcc
     min_val: 0
     max_val: 1

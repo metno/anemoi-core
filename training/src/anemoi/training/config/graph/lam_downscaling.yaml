@@ -14,7 +14,7 @@ nodes:
     attributes: ${graph.attributes.nodes}
   hidden:
     node_builder:
-      _target_: anemoi.graphs.nodes.TriNodes # options: AnemoiDatasetNodes, NPZFileNodes, TriNodes
+      _target_: anemoi.graphs.nodes.LimitedAreaTriNodes
       resolution: 10
       # TODO: we are using carra in the diffusion version, should this be carra?
       reference_node_name: carra
@@ -30,6 +30,7 @@ edges:
         cutoff_factor: 0.6 # only for cutoff method
         source_mask_attr_name: null
         target_mask_attr_name: null
+    attributes: ${graph.attributes.edges}
 
   - source_name: carra
     target_name: hidden
@@ -38,6 +39,7 @@ edges:
         cutoff_factor: 0.6 # only for cutoff method
         source_mask_attr_name: null
         target_mask_attr_name: null
+    attributes: ${graph.attributes.edges}
 
   - source_name: hidden
     target_name: hidden
@@ -71,7 +73,8 @@ edges:
 attributes:
   nodes:
     area_weight:
-      _target_: anemoi.graphs.nodes.attributes.UniformAreaWeights
+      # TODO: use PlanarAreaWeights?
+      _target_: anemoi.graphs.nodes.attributes.UniformWeights
       norm: unit-max
   edges:
     edge_length:

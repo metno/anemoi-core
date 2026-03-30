@@ -1,4 +1,4 @@
-root: ${system.scratch}/caerra/manuelca/experiments/carra-east
+root: ${scratch}/caerra/manuelca/experiments/carra-east
 logs:
   root: ${system.output.root}/logs
   wandb: ${system.output.logs.root}/wandb

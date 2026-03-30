@@ -1,10 +1,12 @@
 defaults:
   - data: downscaling
   - dataloader: downscaling
-  - diagnostics: downscaling
+  - diagnostics: evaluation_downscaling
   - system: slurm
   - graph: lam_downscaling
   - model: downscaling
   - training: downscaling
 
 config_validation: True
+
+scratch: .

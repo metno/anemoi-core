@@ -80,12 +80,12 @@ training_loss:
           alpha: 0.95
 
         - _target_: anemoi.training.losses.spectral.SpectralCRPSLoss
-          transform: fft2d
-          # CARRA EAST domain
+          transform: fft2
+          # CARRA EAST do
           xdim: 789
           ydim: 989
 
-      scalers: ['pressure_level', 'general_variable', 'nan_mask_weights', 'node_weights', 'time_steps']
+      scalers: ['general_variable', 'nan_mask_weights', 'node_weights']
       loss_weights: [1.0, 0.1]
 
 # Validation metrics calculation,
@@ -162,7 +162,7 @@ variable_groups:
 metrics:
   datasets:
     era: []
-    carra: null
+    carra: []
     # TODO: we have these in the diffusion version, I think?
     # - 2t
     # - 10u
