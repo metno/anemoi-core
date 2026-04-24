@@ -107,7 +107,14 @@ def transfer_learning_loading(model: torch.nn.Module, ckpt_path: Path | str) -> 
     # Load the filtered st-ate_dict into the model
     model.load_state_dict(state_dict, strict=False)
     # Needed for data indices check
-    model._ckpt_model_name_to_index = checkpoint["hyper_parameters"]["data_indices"].name_to_index
+    checkpoint_data_indices = checkpoint["hyper_parameters"]["data_indices"]
+    if isinstance(checkpoint_data_indices, dict):
+        model._ckpt_model_name_to_index = {
+            dataset_name: data_indices.name_to_index
+            for dataset_name, data_indices in checkpoint_data_indices.items()
+        }
+    else:
+        model._ckpt_model_name_to_index = {"data": checkpoint_data_indices.name_to_index}
     return model
 
 

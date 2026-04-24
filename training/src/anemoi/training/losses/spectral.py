@@ -156,6 +156,7 @@ class SpectralLoss(BaseLoss):
 
     def _mask_nans_pre_transform(self, pred: torch.Tensor, target: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """Mask NaNs in spatial tensors before spectral transform."""
+        target = self.align_target_to_pred(pred, target)
         if not self.ignore_nans:
             return pred, target
 
