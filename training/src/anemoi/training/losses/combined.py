@@ -143,6 +143,40 @@ class CombinedLoss(BaseLoss):
         self.loss_weights = loss_weights
         del self.scaler  # Remove scaler property from parent class, as it is not used here
 
+    def _component_inputs(
+        self,
+        loss_fn: BaseLoss,
+        pred: torch.Tensor,
+        target: torch.Tensor,
+        kwargs: dict[str, Any],
+        postprocessed_targets_by_dataset: dict[str, torch.Tensor] | None,
+    ) -> tuple[torch.Tensor, torch.Tensor, dict[str, Any], dict[str, torch.Tensor] | None]:
+        if not getattr(loss_fn, "postprocess", False) or kwargs.get("loss_already_postprocessed", False):
+            return pred, target, kwargs, postprocessed_targets_by_dataset
+
+        post_processors_by_dataset = kwargs.get("post_processors_by_dataset")
+        dataset_name = kwargs.get("dataset_name")
+        if post_processors_by_dataset is None or dataset_name is None:
+            raise ValueError("Postprocessed loss components require post_processors_by_dataset and dataset_name.")
+
+        component_kwargs = dict(kwargs)
+        component_pred = post_processors_by_dataset[dataset_name](pred, in_place=False)
+        component_target = post_processors_by_dataset[dataset_name](target, in_place=False)
+
+        targets_by_dataset = kwargs.get("targets_by_dataset")
+        if targets_by_dataset is not None:
+            if postprocessed_targets_by_dataset is None:
+                postprocessed_targets_by_dataset = {}
+                for name, value in targets_by_dataset.items():
+                    if name in post_processors_by_dataset:
+                        postprocessed_targets_by_dataset[name] = post_processors_by_dataset[name](value, in_place=False)
+                    else:
+                        postprocessed_targets_by_dataset[name] = value
+            component_kwargs["targets_by_dataset"] = postprocessed_targets_by_dataset
+
+        component_kwargs["loss_already_postprocessed"] = True
+        return component_pred, component_target, component_kwargs, postprocessed_targets_by_dataset
+
     def forward(
         self,
         pred: torch.Tensor,
@@ -167,11 +201,20 @@ class CombinedLoss(BaseLoss):
             Combined loss
         """
         loss = None
+        postprocessed_targets_by_dataset = None
         for i, loss_fn in enumerate(self.losses):
+            component_pred, component_target, component_kwargs, postprocessed_targets_by_dataset = self._component_inputs(
+                loss_fn,
+                pred,
+                target,
+                kwargs,
+                postprocessed_targets_by_dataset,
+            )
+            component_loss = self.loss_weights[i] * loss_fn(component_pred, component_target, **component_kwargs)
             if loss is not None:
-                loss += self.loss_weights[i] * loss_fn(pred, target, **kwargs)
+                loss += component_loss
             else:
-                loss = self.loss_weights[i] * loss_fn(pred, target, **kwargs)
+                loss = component_loss
         return loss
 
     @staticmethod
@@ -225,12 +268,20 @@ class CombinedLoss(BaseLoss):
         metrics: dict[str, torch.Tensor] = {}
         component_names = self.component_names()
 
+        postprocessed_targets_by_dataset = None
         for i, (loss_fn, component_name) in enumerate(zip(self.losses, component_names, strict=False)):
-            scaled = loss_fn(pred, target, **kwargs)
+            component_pred, component_target, component_kwargs, postprocessed_targets_by_dataset = self._component_inputs(
+                loss_fn,
+                pred,
+                target,
+                kwargs,
+                postprocessed_targets_by_dataset,
+            )
+            scaled = loss_fn(component_pred, component_target, **component_kwargs)
             metrics[f"loss_component_{component_name}_scaled"] = scaled
             metrics[f"loss_component_{component_name}_weighted"] = self.loss_weights[i] * scaled
 
-            raw = self._raw_component_value(loss_fn, pred, target, **kwargs)
+            raw = self._raw_component_value(loss_fn, component_pred, component_target, **component_kwargs)
             if raw is not None:
                 metrics[f"loss_component_{component_name}_raw"] = raw
 

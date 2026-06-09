@@ -32,6 +32,7 @@ class BaseLoss(nn.Module, ABC):
     def __init__(
         self,
         ignore_nans: bool = False,
+        postprocess: bool = False,
     ) -> None:
         """Node- and feature_weighted Loss.
 
@@ -60,6 +61,7 @@ class BaseLoss(nn.Module, ABC):
         self.add_module("scaler", ScaleTensor())
 
         self.ignore_nans = ignore_nans
+        self.postprocess = bool(postprocess)
         self.avg_function = torch.nanmean if ignore_nans else torch.mean
         self.sum_function = torch.nansum if ignore_nans else torch.sum
 

@@ -274,11 +274,15 @@ class ImplementedLossesUsingBaseLossSchema(str, Enum):
     mae = "anemoi.training.losses.MAELoss"
     logcosh = "anemoi.training.losses.LogCoshLoss"
     huber = "anemoi.training.losses.HuberLoss"
+    sampled_grid_afkcrps = "anemoi.training.losses.SampledGridPointAlmostFairKernelCRPS"
     combined = "anemoi.training.losses.combined.CombinedLoss"
     fcl = "anemoi.training.losses.spectral.FourierCorrelationLoss"
     lsd = "anemoi.training.losses.spectral.LogSpectralDistance"
     logfft2d = "anemoi.training.losses.spectral.LogFFT2Distance"
     spectral_crps = "anemoi.training.losses.spectral.SpectralCRPSLoss"
+    tail_weighted_rolling_huber = "anemoi.training.losses.TailWeightedRollingAccumulationHuberLoss"
+    multi_threshold_wet_area = "anemoi.training.losses.MultiThresholdWetAreaLoss"
+    netatmo_wet_dry_on_radar_grid = "anemoi.training.losses.NetatmoWetDryOnRadarGridLoss"
     spectral_l2 = "anemoi.training.losses.spectral.SpectralL2Loss"
     optical_flow = "anemoi.training.losses.optical_flow.OpticalFlowConsistencyLoss"
 
@@ -330,6 +334,43 @@ class HuberLossSchema(BaseLossSchema):
     "Threshold for Huber loss."
 
 
+class SampledGridPointAlmostFairKernelCRPSSchema(AlmostFairKernelCRPSSchema):
+    num_points: int | None = None
+    "Number of random grid points to sample per local shard."
+    fraction: float | None = None
+    "Fraction of local grid points to sample."
+    rescale: bool = True
+    "Rescale the sampled loss to the expected full-grid magnitude."
+
+
+class TailWeightedRollingAccumulationHuberLossSchema(HuberLossSchema):
+    window_size: int
+    step_seconds: float
+    rate_to_amount: bool = True
+    tail_threshold: float = 1.0
+    tail_alpha: float = 2.0
+    tail_temperature: float = 0.5
+
+
+class MultiThresholdWetAreaLossSchema(BaseLossSchema):
+    thresholds: tuple[float, ...] = (0.1, 1.0, 5.0)
+    weights: tuple[float, ...] = (1.0, 0.5, 0.2)
+    temperature: float = 0.1
+
+
+
+class NetatmoWetDryOnRadarGridLossSchema(BaseLossSchema):
+    source_dataset: str = "netatmo"
+    source_nodes_name: str = "netatmo"
+    target_nodes_name: str = "nordic_radar"
+    source_variable: str = "rr"
+    source_threshold: float = 0.1
+    prediction_threshold: float | None = None
+    temperature: float = 0.1
+    min_station_count: int = 1
+    max_distance_degrees: float | None = None
+
+
 class SpectralLossSchema(BaseLossSchema):
     """Spectral loss class."""
 
@@ -352,7 +393,15 @@ class OpticalFlowConsistencyLossSchema(BaseLossSchema):
 
 
 class CombinedLossSchema(BaseLossSchema):
-    losses: list[BaseLossSchema | SpectralLossSchema | OpticalFlowConsistencyLossSchema] = Field(min_length=1)
+    losses: list[
+        BaseLossSchema
+        | SampledGridPointAlmostFairKernelCRPSSchema
+        | TailWeightedRollingAccumulationHuberLossSchema
+        | MultiThresholdWetAreaLossSchema
+        | NetatmoWetDryOnRadarGridLossSchema
+        | SpectralLossSchema
+        | OpticalFlowConsistencyLossSchema
+    ] = Field(min_length=1)
     "Losses to combine, can be any of the normal losses."
     loss_weights: list[int | float] | None = None
     "Weightings of losses, if not set, all losses are weighted equally."
@@ -385,6 +434,10 @@ LossSchemas = (
     | CombinedLossSchema
     | AlmostFairKernelCRPSSchema
     | KernelCRPSSchema
+    | SampledGridPointAlmostFairKernelCRPSSchema
+    | TailWeightedRollingAccumulationHuberLossSchema
+    | MultiThresholdWetAreaLossSchema
+    | NetatmoWetDryOnRadarGridLossSchema
     | SpectralLossSchema
     | OpticalFlowConsistencyLossSchema
     | MultiScaleLossSchema

@@ -337,8 +337,6 @@ class GraphForecasterSparse(BaseRolloutGraphModule):
             y_pred = {}
             y = {}
             for dataset_name, dataset_batch in batch.items():
-                if dataset_name not in y_pred_full:
-                    continue
                 if len(self.dataset_target_relative_time_indices[dataset_name]) == 0:
                     continue
 
@@ -350,11 +348,13 @@ class GraphForecasterSparse(BaseRolloutGraphModule):
                     dataset_name=dataset_name,
                     relative_times=target_relative_times,
                 )
-                pred_index = torch.tensor(pred_positions, device=dataset_batch.device, dtype=torch.long)
                 batch_index = torch.tensor(batch_positions, device=dataset_batch.device, dtype=torch.long)
                 y_time = dataset_batch.index_select(1, batch_index)
                 y[dataset_name] = y_time
-                y_pred[dataset_name] = y_pred_full[dataset_name].index_select(1, pred_index)
+
+                if dataset_name in y_pred_full:
+                    pred_index = torch.tensor(pred_positions, device=dataset_batch.device, dtype=torch.long)
+                    y_pred[dataset_name] = y_pred_full[dataset_name].index_select(1, pred_index)
 
             loss, metrics_next, y_pred = checkpoint(
                 self.compute_loss_metrics,
@@ -569,8 +569,6 @@ class GraphEnsForecasterSparse(GraphForecasterSparse):
             y_pred = {}
             y = {}
             for dataset_name, dataset_batch in batch.items():
-                if dataset_name not in y_pred_full:
-                    continue
                 if len(self.dataset_target_relative_time_indices[dataset_name]) == 0:
                     continue
 
@@ -582,11 +580,13 @@ class GraphEnsForecasterSparse(GraphForecasterSparse):
                     dataset_name=dataset_name,
                     relative_times=target_relative_times,
                 )
-                pred_index = torch.tensor(pred_positions, device=dataset_batch.device, dtype=torch.long)
                 batch_index = torch.tensor(batch_positions, device=dataset_batch.device, dtype=torch.long)
                 y_time = dataset_batch.index_select(1, batch_index)
                 y[dataset_name] = y_time[:, :, 0, :, :]
-                y_pred[dataset_name] = y_pred_full[dataset_name].index_select(1, pred_index)
+
+                if dataset_name in y_pred_full:
+                    pred_index = torch.tensor(pred_positions, device=dataset_batch.device, dtype=torch.long)
+                    y_pred[dataset_name] = y_pred_full[dataset_name].index_select(1, pred_index)
 
             loss, metrics_next, y_pred_ens = checkpoint(
                 self.compute_loss_metrics,

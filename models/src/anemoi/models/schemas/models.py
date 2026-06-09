@@ -199,6 +199,17 @@ class DiffusionSchema(BaseModel):
     "Default parameters for inference sampling"
 
 
+class StationDropoutSchema(PydanticBaseModel):
+    dataset: str = Field(default="netatmo")
+    "Dataset whose station inputs are randomly dropped during training."
+    rate: float = Field(default=0.0, ge=0.0, le=1.0)
+    "Probability of dropping each station input history."
+    variables: list[str] = Field(default_factory=list)
+    "Input variables to drop. Defaults to prognostic input variables."
+    fill_value: float = Field(default=0.0)
+    "Replacement value used for dropped input variables."
+
+
 class BaseModelSchema(PydanticBaseModel):
     num_channels: NonNegativeInt = Field(example=512)
     "Feature tensor size in the hidden space."
@@ -212,6 +223,8 @@ class BaseModelSchema(PydanticBaseModel):
     "List of bounding configuration applied in order to the specified variables."
     output_mask: OutputMaskSchemas  # !TODO CHECK!
     "Output mask"
+    station_dropout: StationDropoutSchema | None = Field(default=None)
+    "Optional station-input dropout used as training regularisation."
     latent_skip: bool = True
     "Add skip connection in latent space before/after processor. Currently only in interpolator."
     processor: Union[

@@ -54,6 +54,7 @@ class FFT2D(SpectralTransform):
         x_dim: int,
         y_dim: int,
         apply_filter: bool = True,
+        norm: str | None = None,
         nodes_slice: tuple[int, int | None] | None = None,
         patch_size: tuple[int, int] | None = None,
         patch_stride: tuple[int, int] | None = None,
@@ -70,6 +71,8 @@ class FFT2D(SpectralTransform):
             size of the spatial dimension y of the original data in 2D
         apply_filter: bool
             Apply low-pass filter to ignore frequencies beyond the Nyquist limit
+        norm: str | None
+            FFT normalization passed to torch.fft.fft2.
         patch_size: tuple[int, int] | None
             Optional patch size `(patch_y, patch_x)` for patch-wise FFT.
             If None, FFT is applied on the full `(y, x)` field.
@@ -93,6 +96,7 @@ class FFT2D(SpectralTransform):
         # by slicing random parts of the input
         self.nodes_slice = slice(*nodes_slice)
         self.apply_filter = apply_filter
+        self.norm = norm
 
         if self.patch_size is not None:
             patch_y, patch_x = self.patch_size
@@ -156,7 +160,7 @@ class FFT2D(SpectralTransform):
             ) from e
 
         if self.patch_size is None:
-            fft = torch.fft.fft2(data, dim=(-2, -3))
+            fft = torch.fft.fft2(data, dim=(-2, -3), norm=self.norm)
             if self.apply_filter:
                 fft *= self.filter.to(device=data.device, dtype=data.dtype)
             return fft
@@ -173,7 +177,7 @@ class FFT2D(SpectralTransform):
         unfolded = F.unfold(flat, kernel_size=(patch_y, patch_x), stride=(stride_y, stride_x))
         n_patches = unfolded.shape[-1]
         patches = unfolded.transpose(1, 2).reshape(-1, n_patches, var, patch_y, patch_x)
-        fft = torch.fft.fft2(patches, dim=(-2, -1))
+        fft = torch.fft.fft2(patches, dim=(-2, -1), norm=self.norm)
 
         padded_y = self.y_dim + self.patch_pad_y
         padded_x = self.x_dim + self.patch_pad_x

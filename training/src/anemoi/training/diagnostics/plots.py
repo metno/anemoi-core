@@ -406,6 +406,7 @@ def plot_predicted_multilevel_flat_sample(
     precip_and_related_fields: list | None = None,
     colormaps: dict[str, Colormap] | None = None,
     dpi: int = 100,
+    precip_unit_scale: float = 1000.0,
 ) -> Figure:
     """Plots data for one multilevel latlon-"flat" sample.
 
@@ -477,6 +478,7 @@ def plot_predicted_multilevel_flat_sample(
             precip_and_related_fields=precip_and_related_fields,
             cmap=cmap,
             error_cmap=error_cmap,
+            precip_unit_scale=precip_unit_scale,
         )
     return fig
 
@@ -495,6 +497,7 @@ def plot_flat_sample(
     precip_and_related_fields: list | None = None,
     cmap: Colormap | None = None,
     error_cmap: Colormap | None = None,
+    precip_unit_scale: float = 1000.0,
 ) -> None:
     """Plot a "flat" 1D sample.
 
@@ -536,10 +539,10 @@ def plot_flat_sample(
     precip_and_related_fields = precip_and_related_fields or []
     if vname in precip_and_related_fields:
         # converting to mm from m
-        truth *= 1000.0
-        pred *= 1000.0
+        truth *= precip_unit_scale
+        pred *= precip_unit_scale
         if np.nansum(input_) != 0:
-            input_ *= 1000.0
+            input_ *= precip_unit_scale
     data = [None for _ in range(6)]
     # truth, prediction and prediction error always plotted
     data[1:4] = [truth, pred, truth - pred]
@@ -1029,6 +1032,7 @@ def plot_ensemble_sample(
     precip_and_related_fields: list | None = None,
     cmap: Colormap | None = None,
     error_cmap: Colormap | None = None,
+    precip_unit_scale: float = 1000.0,
 ) -> None:
     """Use this when plotting ensembles.
 
@@ -1070,8 +1074,8 @@ def plot_ensemble_sample(
     precip_and_related_fields = precip_and_related_fields if precip_and_related_fields is not None else []
     if vname in precip_and_related_fields:
         # converting to mm from m
-        truth *= 1000.0
-        pred_ens *= 1000.0
+        truth *= precip_unit_scale
+        pred_ens *= precip_unit_scale
         cummulation_lvls = clevels
         norm = BoundaryNorm(cummulation_lvls, len(cummulation_lvls) + 1)
     else:

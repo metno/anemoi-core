@@ -94,8 +94,19 @@ class MultiDataset(IterableDataset):
         self.timing_rank0_only = bool(getattr(debug, "timing_rank0_only", True))
         self._timing_sample_counter = 0
 
+        self.static_dataset_names = set()
+        data_readers_for_create = {}
+        for name, data_reader in data_readers.items():
+            if hasattr(data_reader, "get"):
+                data_reader = dict(data_reader)
+                if bool(data_reader.pop("static", False)):
+                    self.static_dataset_names.add(name)
+                    data_reader.pop("start", None)
+                    data_reader.pop("end", None)
+            data_readers_for_create[name] = data_reader
+
         # Create each dataset
-        self.datasets = {name: create_dataset(data_reader) for name, data_reader in data_readers.items()}
+        self.datasets = {name: create_dataset(data_reader) for name, data_reader in data_readers_for_create.items()}
         self._dates_ns_by_dataset, self._date_to_native_index_by_dataset = self._build_dataset_date_index_maps()
 
         # Build per-dataset model/native relative indices.
@@ -844,11 +855,19 @@ class MultiDataset(IterableDataset):
         if anchor_dates_ns is None or dataset_dates_ns is None or dataset_date_map is None:
             return None
 
+        model_relative_indices = self.model_relative_date_indices_by_dataset[dataset_name]
+        if dataset_name in self.static_dataset_names:
+            native_index = self._first_available_native_index(self.datasets[dataset_name])
+            if native_index is None:
+                return [-1] * len(model_relative_indices)
+            if len(model_relative_indices) == 1:
+                return int(native_index)
+            return [int(native_index)] * len(model_relative_indices)
+
         if not (0 <= index < len(anchor_dates_ns)):
-            return [-1] * len(self.model_relative_date_indices_by_dataset[dataset_name])
+            return [-1] * len(model_relative_indices)
 
         anchor_date_ns = int(anchor_dates_ns[index])
-        model_relative_indices = self.model_relative_date_indices_by_dataset[dataset_name]
         offsets_ns = model_relative_indices.astype(np.int64, copy=False) * self.timestep_seconds * 1_000_000_000
         requested_dates_ns = anchor_date_ns + offsets_ns
 

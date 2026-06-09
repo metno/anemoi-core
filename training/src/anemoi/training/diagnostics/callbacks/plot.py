@@ -1336,6 +1336,7 @@ class PlotSample(BasePlotAdditionalMetrics):
         precip_and_related_fields: list[str] | None = None,
         colormaps: dict[str, Colormap] | None = None,
         per_sample: int = 6,
+        precip_unit_scale: float = 1000.0,
         every_n_batches: int | None = None,
         dataset_names: list[str] | None = None,
         focus_area: list[dict] | None = None,
@@ -1373,6 +1374,7 @@ class PlotSample(BasePlotAdditionalMetrics):
         self.accumulation_levels_plot = accumulation_levels_plot
         self.output_steps = output_steps
         self.per_sample = per_sample
+        self.precip_unit_scale = float(precip_unit_scale)
         self.colormaps = colormaps
 
         LOGGER.info(
@@ -1438,6 +1440,7 @@ class PlotSample(BasePlotAdditionalMetrics):
                             datashader=self.datashader_plotting,
                             precip_and_related_fields=self.precip_and_related_fields,
                             colormaps=self.colormaps,
+                            precip_unit_scale=self.precip_unit_scale,
                         )
 
                         self._output_figure(
@@ -1470,6 +1473,7 @@ class PlotSample(BasePlotAdditionalMetrics):
                         datashader=self.datashader_plotting,
                         precip_and_related_fields=self.precip_and_related_fields,
                         colormaps=self.colormaps,
+                        precip_unit_scale=self.precip_unit_scale,
                     )
 
                     self._output_figure(
@@ -1494,6 +1498,7 @@ class MultiStepPlot(BasePlotAdditionalMetrics):
         precip_and_related_fields: list[str] | None = None,
         colormaps: dict[str, Colormap] | None = None,
         per_sample: int = 6,
+        precip_unit_scale: float = 1000.0,
         every_n_batches: int | None = None,
         dataset_names: list[str] | None = None,
         focus_area: list[dict] | None = None,
@@ -1513,6 +1518,7 @@ class MultiStepPlot(BasePlotAdditionalMetrics):
         self.precip_and_related_fields = precip_and_related_fields
         self.colormaps = colormaps
         self.per_sample = per_sample
+        self.precip_unit_scale = float(precip_unit_scale)
         self.video = video
         self.animation_interval = animation_interval
         self.video_fps = video_fps
@@ -1596,6 +1602,7 @@ class MultiStepPlot(BasePlotAdditionalMetrics):
                     precip_and_related_fields=self.precip_and_related_fields,
                     colormaps=self.colormaps,
                     dpi=self.frame_dpi,
+                    precip_unit_scale=self.precip_unit_scale,
                 )
 
                 if self.save_frames:

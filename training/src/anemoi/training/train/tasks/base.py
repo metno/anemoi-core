@@ -283,12 +283,14 @@ class BaseGraphModule(pl.LightningModule, ABC):
                 dataset_scalers,
                 data_indices[dataset_name],
             )
+            self._set_graph_data_on_loss(self.loss[dataset_name], graph_data)
 
             self.metrics[dataset_name] = self._build_metrics_for_dataset(
                 val_metrics_configs[dataset_name],
                 scalers=dataset_scalers,
                 data_indices=data_indices[dataset_name],
             )
+            self._set_graph_data_on_loss(self.metrics[dataset_name], graph_data)
             self._scaling_values_log[dataset_name] = print_variable_scaling(
                 self.loss[dataset_name],
                 data_indices[dataset_name],
@@ -405,6 +407,14 @@ class BaseGraphModule(pl.LightningModule, ABC):
     @cached_property
     def logger_enabled(self) -> bool:
         return self.trainer.logger is not None
+
+    @staticmethod
+    def _set_graph_data_on_loss(loss_obj: torch.nn.Module, graph_data: HeteroData) -> None:
+        set_graph_data = getattr(loss_obj, "set_graph_data", None)
+        if callable(set_graph_data):
+            set_graph_data(graph_data)
+        for child in loss_obj.children():
+            BaseGraphModule._set_graph_data_on_loss(child, graph_data)
 
     def _build_metrics_for_dataset(
         self,
@@ -629,6 +639,8 @@ class BaseGraphModule(pl.LightningModule, ABC):
             grid_shard_slice=grid_shard_slice,
             group=self.model_comm_group,
             dataset_name=dataset_name,
+            post_processors_by_dataset=self.model.post_processors,
+            loss_already_postprocessed=getattr(self, "training_loss_postprocessed", False),
             **kwargs,
         )
 
@@ -658,6 +670,8 @@ class BaseGraphModule(pl.LightningModule, ABC):
             grid_shard_slice=grid_shard_slice,
             group=self.model_comm_group,
             dataset_name=dataset_name,
+            post_processors_by_dataset=self.model.post_processors,
+            loss_already_postprocessed=getattr(self, "training_loss_postprocessed", False),
             **kwargs,
         )
 
@@ -667,7 +681,7 @@ class BaseGraphModule(pl.LightningModule, ABC):
         y: torch.Tensor,
         grid_shard_slice: slice | None = None,
         dataset_name: str | None = None,
-        **_kwargs,
+        **kwargs,
     ) -> dict[str, torch.Tensor]:
         """Compute validation metrics.
 
@@ -685,7 +699,13 @@ class BaseGraphModule(pl.LightningModule, ABC):
         dict[str, torch.Tensor]
             Computed metrics
         """
-        return self.calculate_val_metrics(y_pred, y, grid_shard_slice=grid_shard_slice, dataset_name=dataset_name)
+        return self.calculate_val_metrics(
+            y_pred,
+            y,
+            grid_shard_slice=grid_shard_slice,
+            dataset_name=dataset_name,
+            **kwargs,
+        )
 
     def compute_dataset_loss_metrics(
         self,
@@ -816,6 +836,8 @@ class BaseGraphModule(pl.LightningModule, ABC):
                 y[dataset_name],
                 validation_mode=validation_mode,
                 dataset_name=dataset_name,
+                targets_by_dataset=y,
+                data_indices_by_dataset=self.data_indices,
                 **kwargs,
             )
 
@@ -1007,7 +1029,7 @@ class BaseGraphModule(pl.LightningModule, ABC):
         grid_shard_slice: slice | None = None,
         dataset_name: str | None = None,
         step: int | None = None,
-        **_kwargs,
+        **kwargs,
     ) -> dict[str, torch.Tensor]:
         """Calculate metrics on the validation output.
 
@@ -1065,6 +1087,7 @@ class BaseGraphModule(pl.LightningModule, ABC):
                     scaler_indices=(..., indices),
                     grid_shard_slice=grid_shard_slice,
                     group=self.model_comm_group,
+                    **kwargs,
                 )
 
         return metrics
@@ -1119,22 +1142,33 @@ class BaseGraphModule(pl.LightningModule, ABC):
         if summary_parts:
             LOGGER.info("Validation summary: %s", ", ".join(summary_parts))
 
+        global_component_total = sum(component_value for _, _, component_value in component_metrics)
         for dataset_name, component_name, component_value in component_metrics:
             total_value = total_losses.get(dataset_name, fallback_total)
-            if total_value is None or total_value == 0:
-                continue
             label = _friendly_component_name(component_name)
             if dataset_name != "data":
                 label = f"{dataset_name}:{label}"
             loss_weight = component_weights.get(dataset_name, {}).get(component_name)
+            if total_value is not None and total_value != 0:
+                if loss_weight is None:
+                    LOGGER.info("Relative contribution metric %s: %.2f%%", label, 100.0 * component_value / total_value)
+                else:
+                    LOGGER.info(
+                        "Relative contribution metric %s for loss weight %.6g: %.2f%%",
+                        label,
+                        loss_weight,
+                        100.0 * component_value / total_value,
+                    )
+            if global_component_total == 0:
+                continue
             if loss_weight is None:
-                LOGGER.info("Relative contribution metric %s: %.2f%%", label, 100.0 * component_value / total_value)
+                LOGGER.info("Global contribution metric %s: %.2f%%", label, 100.0 * component_value / global_component_total)
                 continue
             LOGGER.info(
-                "Relative contribution metric %s for loss weight %.6g: %.2f%%",
+                "Global contribution metric %s for loss weight %.6g: %.2f%%",
                 label,
                 loss_weight,
-                100.0 * component_value / total_value,
+                100.0 * component_value / global_component_total,
             )
 
     def training_step(self, batch: dict[str, torch.Tensor], batch_idx: int) -> torch.Tensor:

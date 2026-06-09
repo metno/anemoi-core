@@ -11,6 +11,8 @@ from .combined import CombinedLoss
 from .huber import HuberLoss
 from .kcrps import AlmostFairKernelCRPS
 from .kcrps import KernelCRPS
+from .kcrps import SampledNetatmoAlmostFairKernelCRPSOnRadarGridLoss
+from .kcrps import SampledGridPointAlmostFairKernelCRPS
 from .logcosh import LogCoshLoss
 from .loss import get_loss_function
 from .mae import MAELoss
@@ -19,6 +21,7 @@ from .multiscale import MultiscaleLossWrapper
 from .optical_flow import OpticalFlowConsistencyLoss
 from .rmse import RMSELoss
 from .rolling_accumulation import RollingAccumulationHuberLoss
+from .rolling_accumulation import TailWeightedRollingAccumulationHuberLoss
 from .spectral import FourierCorrelationLoss
 from .spectral import LogFFT2Distance
 from .spectral import LogSpectralDistance
@@ -27,6 +30,8 @@ from .spectral import SpectralL2Loss
 from .ssim import SSIMLoss
 from .ssim import MaskedLogSSIMLoss
 from .weighted_mse import WeightedMSELoss
+from .wet_area_loss import MultiThresholdWetAreaLoss
+from .wet_area_loss import NetatmoWetDryOnRadarGridLoss
 from .wet_area_loss import WeightedSoftWetAreaLoss
 from .optical_flow import OpticalFlowConsistencyLoss
 from .optical_flow import SoftWetMaskAdvectiveConsistencyLoss
@@ -43,11 +48,16 @@ __all__ = [
     "MAELoss",
     "MaskedLogSSIMLoss",
     "MSELoss",
+    "MultiThresholdWetAreaLoss",
+    "NetatmoWetDryOnRadarGridLoss",
     "MultiscaleLossWrapper",
     "OpticalFlowConsistencyLoss",
     "SoftWetMaskAdvectiveConsistencyLoss",
     "RMSELoss",
+    "SampledNetatmoAlmostFairKernelCRPSOnRadarGridLoss",
+    "SampledGridPointAlmostFairKernelCRPS",
     "RollingAccumulationHuberLoss",
+    "TailWeightedRollingAccumulationHuberLoss",
     "SpectralCRPSLoss",
     "SpectralL2Loss",
     "SSIMLoss",

@@ -62,6 +62,12 @@ class AnemoiModelEncProcDecUnionDecoderForecaster(AnemoiModelEncProcDec):
                 self.qc_var[str(ds_name)] = str(cfg.get("qc_var", "qc_flags"))
                 self.qc[str(ds_name)] = QCFeaturizer(method=cfg.get("method", "decode_bits"), qc_cfg=cfg)
 
+        station_dropout_cfg = DotDict(model_config.model.get("station_dropout", {}) or {})
+        self.station_dropout_dataset = str(station_dropout_cfg.get("dataset", "netatmo"))
+        self.station_dropout_rate = float(station_dropout_cfg.get("rate", 0.0))
+        self.station_dropout_fill_value = float(station_dropout_cfg.get("fill_value", 0.0))
+        self.station_dropout_variables = tuple(str(var) for var in station_dropout_cfg.get("variables", []))
+
         datasets = list(data_indices.keys())
         raw_dataset_time_indices = model_config.training.get("dataset_time_indices", None)
         dataset_time_indices_cfg = raw_dataset_time_indices
@@ -137,6 +143,42 @@ class AnemoiModelEncProcDecUnionDecoderForecaster(AnemoiModelEncProcDec):
 
         node_attr = self.node_attributes.attr_ndims[dataset_name]
         return base + dataset_n_step_input * qc_extra + node_attr
+
+    def _apply_station_dropout(self, x: torch.Tensor, *, dataset_name: str) -> torch.Tensor:
+        if (
+            not self.training
+            or self.station_dropout_rate <= 0.0
+            or dataset_name != self.station_dropout_dataset
+            or x.shape[3] == 0
+        ):
+            return x
+
+        if self.station_dropout_variables:
+            name_to_index = getattr(self.data_indices[dataset_name].model.input, "name_to_index", None)
+            if name_to_index is None:
+                raise KeyError(f"Cannot resolve station dropout variables for dataset {dataset_name!r}.")
+            variable_indices = [int(name_to_index[var]) for var in self.station_dropout_variables]
+        else:
+            variable_indices = [int(idx) for idx in self.data_indices[dataset_name].model.input.prognostic]
+
+        if len(variable_indices) == 0:
+            return x
+
+        dropout_rate = min(max(self.station_dropout_rate, 0.0), 1.0)
+        keep_mask = torch.rand(x.shape[0], x.shape[3], device=x.device) >= dropout_rate
+        if not bool(keep_mask.any(dim=1).all()):
+            empty_batches = torch.nonzero(~keep_mask.any(dim=1), as_tuple=False).squeeze(-1)
+            keep_index = torch.randint(x.shape[3], (empty_batches.numel(),), device=x.device)
+            keep_mask[empty_batches, keep_index] = True
+
+        drop_mask = ~keep_mask[:, None, None, :, None]
+        x_dropped = x.clone()
+        variable_index = torch.tensor(variable_indices, device=x.device, dtype=torch.long)
+        values = x_dropped.index_select(-1, variable_index)
+        fill_value = torch.as_tensor(self.station_dropout_fill_value, device=x.device, dtype=x.dtype)
+        values = torch.where(drop_mask, fill_value, values)
+        x_dropped[..., variable_index] = values
+        return x_dropped
 
     def _get_provider_decode_index(
         self,
@@ -255,6 +297,7 @@ class AnemoiModelEncProcDecUnionDecoderForecaster(AnemoiModelEncProcDec):
             x_in = x[dataset_name]
             if x_in.is_floating_point() and x_hidden_latent.is_floating_point() and x_in.dtype != x_hidden_latent.dtype:
                 x_in = x_in.to(dtype=x_hidden_latent.dtype)
+            x_in = self._apply_station_dropout(x_in, dataset_name=dataset_name)
             x_aug = self._append_qc_features(x_in, dataset_name=dataset_name)
 
             x_data_latent, x_skip, shard_shapes_data = self._assemble_input(
@@ -315,7 +358,9 @@ class AnemoiModelEncProcDecUnionDecoderForecaster(AnemoiModelEncProcDec):
         provider_by_dataset = getattr(self, "decoder_provider_by_dataset", {})
         decode_groups: dict[str, list[str]] = {}
         for dataset_name in dataset_names:
-            provider_name = str(provider_by_dataset.get(dataset_name, dataset_name))
+            if dataset_name not in provider_by_dataset:
+                continue
+            provider_name = str(provider_by_dataset[dataset_name])
             decode_groups.setdefault(provider_name, []).append(dataset_name)
 
         provider_x_dst_base: dict[str, torch.Tensor] = {}
@@ -457,7 +502,7 @@ class AnemoiModelEncProcDecUnionDecoderForecaster(AnemoiModelEncProcDec):
 
 
 class AnemoiEnsModelEncProcDecUnionDecoderForecaster(AnemoiModelEncProcDecUnionDecoderForecaster):
-    """Sparse union forecaster with ensemble noise injected into one dataset path."""
+    """Sparse union forecaster with ensemble noise injected into the summed latent state."""
 
     def __init__(
         self,
@@ -478,7 +523,6 @@ class AnemoiEnsModelEncProcDecUnionDecoderForecaster(AnemoiModelEncProcDecUnionD
     def _build_networks(self, model_config: DotDict) -> None:
         super()._build_networks(model_config)
         model_cfg = DotDict(model_config).model
-        self.noise_dataset = str(model_cfg.get("noise_dataset", "nordic_radar"))
         self.noise_injector = instantiate(
             model_cfg.noise_injector,
             _recursive_=False,
@@ -562,7 +606,7 @@ class AnemoiEnsModelEncProcDecUnionDecoderForecaster(AnemoiModelEncProcDecUnionD
         grid_shard_shapes: dict[str, list] | None = None,
         **kwargs,
     ) -> dict[str, Tensor]:
-        """Forward pass with dataset-local noise before hidden processing."""
+        """Forward pass with ensemble noise before hidden processing."""
         del kwargs
         dataset_names = list(x.keys())
 
@@ -591,6 +635,7 @@ class AnemoiEnsModelEncProcDecUnionDecoderForecaster(AnemoiModelEncProcDecUnionD
             x_in = x[dataset_name]
             if x_in.is_floating_point() and x_hidden_latent.is_floating_point() and x_in.dtype != x_hidden_latent.dtype:
                 x_in = x_in.to(dtype=x_hidden_latent.dtype)
+            x_in = self._apply_station_dropout(x_in, dataset_name=dataset_name)
             x_aug = self._append_qc_features(x_in, dataset_name=dataset_name)
 
             x_data_latent, x_skip, shard_shapes_data = self._assemble_input(
@@ -626,28 +671,21 @@ class AnemoiEnsModelEncProcDecUnionDecoderForecaster(AnemoiModelEncProcDecUnionD
             x_data_latent_dict[dataset_name] = x_data_latent
             dataset_latents[dataset_name] = x_latent
 
-        if self.noise_dataset not in dataset_latents:
-            raise KeyError(
-                f"Noise dataset '{self.noise_dataset}' is not present in this batch. "
-                f"Available datasets: {dataset_names}"
-            )
-
         shard_shapes_hidden = shard_shapes_hidden_dict[dataset_names[0]]
         assert all(
             shard_shape == shard_shapes_hidden for shard_shape in shard_shapes_hidden_dict.values()
         ), "All datasets must have the same shard shapes for the hidden graph."
 
-        noisy_latent, latent_noise = self.noise_injector(
-            x=dataset_latents[self.noise_dataset],
+        x_latent = sum(dataset_latents.values())
+        x_latent_proc, latent_noise = self.noise_injector(
+            x=x_latent,
             batch_size=batch_size,
             ensemble_size=ensemble_size,
             grid_size=self.node_attributes.num_nodes[self._graph_name_hidden],
             shard_shapes_ref=shard_shapes_hidden,
-            noise_dtype=dataset_latents[self.noise_dataset].dtype,
+            noise_dtype=x_latent.dtype,
             model_comm_group=model_comm_group,
         )
-        dataset_latents[self.noise_dataset] = noisy_latent
-        x_latent = sum(dataset_latents.values())
 
         processor_edge_attr, processor_edge_index, proc_edge_shard_shapes = self.processor_graph_provider.get_edges(
             batch_size=batch_size,
@@ -656,7 +694,7 @@ class AnemoiEnsModelEncProcDecUnionDecoderForecaster(AnemoiModelEncProcDecUnionD
         processor_kwargs = {"cond": latent_noise} if latent_noise is not None else {}
 
         x_latent_proc = self.processor(
-            x=x_latent,
+            x=x_latent_proc,
             batch_size=batch_size,
             shard_shapes=shard_shapes_hidden,
             edge_attr=processor_edge_attr,
@@ -670,7 +708,9 @@ class AnemoiEnsModelEncProcDecUnionDecoderForecaster(AnemoiModelEncProcDecUnionD
         provider_by_dataset = getattr(self, "decoder_provider_by_dataset", {})
         decode_groups: dict[str, list[str]] = {}
         for dataset_name in dataset_names:
-            provider_name = str(provider_by_dataset.get(dataset_name, dataset_name))
+            if dataset_name not in provider_by_dataset:
+                continue
+            provider_name = str(provider_by_dataset[dataset_name])
             decode_groups.setdefault(provider_name, []).append(dataset_name)
 
         provider_x_dst_base: dict[str, torch.Tensor] = {}

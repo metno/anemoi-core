@@ -378,19 +378,39 @@ class SpectralCRPSLoss(SpectralLoss, AlmostFairKernelCRPS):
         is_sharded = grid_shard_slice is not None
         group = group if is_sharded else None
 
-        pred, target = self._mask_nans_pre_transform(pred, target)
+        if target.ndim == pred.ndim:
+            target_ens_size = target.shape[TensorDim.ENSEMBLE_DIM]
+            pred_ens_size = pred.shape[TensorDim.ENSEMBLE_DIM]
+            if target_ens_size not in (1, pred_ens_size):
+                raise ValueError(
+                    "Prediction and target ensemble dimensions are incompatible: "
+                    f"pred={tuple(pred.shape)}, target={tuple(target.shape)}"
+                )
+            target = target.select(TensorDim.ENSEMBLE_DIM, 0)
+        elif target.ndim != pred.ndim - 1:
+            raise ValueError(
+                "SpectralCRPSLoss expects target with no ensemble dimension, or a target broadcast over ensemble "
+                f"members: pred={tuple(pred.shape)}, target={tuple(target.shape)}"
+            )
+
+        if self.ignore_nans:
+            target_nan_mask = torch.isnan(target)
+            target = target.masked_fill(target_nan_mask, 0.0)
+            pred = pred.masked_fill(target_nan_mask.unsqueeze(TensorDim.ENSEMBLE_DIM), 0.0)
+
         # → [..., modes, vars]
         pred_spec = self._to_spectral_flat(pred)
         tgt_spec = self._to_spectral_flat(target)
         n_modes = pred_spec.size(dim=TensorDim.GRID.value)
 
         pred_spec = einops.rearrange(pred_spec, "b t e m v -> b t v m e")  # ensemble dim last for preds
-        tgt_spec = einops.rearrange(tgt_spec, "... m v -> (...) v m")  # remove ensemble dim for targets
+        tgt_spec = einops.rearrange(tgt_spec, "b t m v -> b t v m")
         if self.no_autocast:
             with torch.amp.autocast(device_type="cuda", enabled=False):
                 crps = self._kernel_crps(pred_spec, tgt_spec, alpha=self.alpha)
         else:
             crps = self._kernel_crps(pred_spec, tgt_spec, alpha=self.alpha)
+        crps = torch.real(crps)
         crps = einops.rearrange(crps, "b t v m -> b t 1 m v")  # consistent with tensordim
 
         scaled = self.scale(

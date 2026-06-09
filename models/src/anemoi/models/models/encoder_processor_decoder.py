@@ -73,14 +73,26 @@ class AnemoiModelEncProcDec(BaseGraphModel):
         # Decoder hidden -> data
         decoder_sel_cfg = DotDict(model_config.model.get("decoder_graph_selection", {}))
         decoder_provider_cfg = DotDict(decoder_sel_cfg.get("provider_datasets", {}))
+        decoder_target_datasets = decoder_sel_cfg.get("target_datasets", None)
+        if decoder_target_datasets is None:
+            self.decoder_target_dataset_names = tuple(self.dataset_names)
+        else:
+            self.decoder_target_dataset_names = tuple(str(dataset_name) for dataset_name in decoder_target_datasets)
+            unknown_dataset_names = sorted(set(self.decoder_target_dataset_names).difference(self.dataset_names))
+            if unknown_dataset_names:
+                raise ValueError(
+                    f"decoder_graph_selection.target_datasets contains unknown datasets: {unknown_dataset_names}. "
+                    f"Known datasets: {self.dataset_names}"
+                )
+
         self.decoder_provider_by_dataset = {
             dataset_name: str(decoder_provider_cfg.get(dataset_name, dataset_name))
-            for dataset_name in self.dataset_names
+            for dataset_name in self.decoder_target_dataset_names
         }
         self.decoder_graph_provider = torch.nn.ModuleDict()
         self.decoder = torch.nn.ModuleDict()
         self.decoder_template_dataset_by_provider: dict[str, str] = {}
-        for dataset_name in self.dataset_names:
+        for dataset_name in self.decoder_target_dataset_names:
             provider_name = self.decoder_provider_by_dataset[dataset_name]
             if provider_name not in self.node_attributes.num_nodes:
                 raise KeyError(
@@ -327,12 +339,15 @@ class AnemoiModelEncProcDec(BaseGraphModel):
         # Decoder
         x_out_dict = {}
         for dataset_name in dataset_names:
+            if dataset_name not in self.decoder_provider_by_dataset:
+                continue
+            provider_name = self.decoder_provider_by_dataset[dataset_name]
             # Compute decoder edges using updated latent representation
             decoder_edge_attr, decoder_edge_index, dec_edge_shard_shapes = self.decoder_graph_provider[
-                dataset_name
+                provider_name
             ].get_edges(batch_size=batch_size, model_comm_group=model_comm_group)
 
-            x_out = self.decoder[dataset_name](
+            x_out = self.decoder[provider_name](
                 (x_latent_proc, x_data_latent_dict[dataset_name]),
                 batch_size=batch_size,
                 shard_shapes=(shard_shapes_hidden, shard_shapes_data_dict[dataset_name]),

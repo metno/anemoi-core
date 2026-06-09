@@ -158,7 +158,7 @@ class BaseRolloutGraphModule(BaseGraphModule, ABC):
         dataset_name: str,
         step: int | None = None,
         grid_shard_slice: slice | None = None,
-        **_kwargs,
+        **kwargs,
     ) -> dict[str, torch.Tensor]:
         """Compute validation metrics.
 
@@ -182,6 +182,7 @@ class BaseRolloutGraphModule(BaseGraphModule, ABC):
             step=step,
             grid_shard_slice=grid_shard_slice,
             dataset_name=dataset_name,
+            **kwargs,
         )
 
     def training_step(self, batch: dict[str, torch.Tensor], batch_idx: int) -> torch.Tensor:
