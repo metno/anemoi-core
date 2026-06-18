@@ -311,6 +311,10 @@ class AlmostFairKernelCRPSSchema(BaseLossSchema):
     "Optional scaler name whose values are used directly as the local alpha map."
     no_autocast: bool = True
     "Deactivate autocast for the kernel CRPS calculation"
+    log_total_counts: bool = False
+    "Log predicted and target total counts for count-style losses."
+    log_total_counts_label: str = "count"
+    "Label used when logging total counts."
 
 
 class MultiScaleLossSchema(BaseModel):

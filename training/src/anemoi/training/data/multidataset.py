@@ -7,6 +7,7 @@
 # granted to it by virtue of its status as an intergovernmental organisation
 # nor does it submit to any jurisdiction.
 
+import csv
 import datetime
 import logging
 import os
@@ -89,6 +90,8 @@ class MultiDataset(IterableDataset):
             explicit_time_indices_by_dataset,
         )
         debug = debug or {}
+        date_filter_cfg = debug.get("date_filter", None) if hasattr(debug, "get") else getattr(debug, "date_filter", None)
+        self.date_filter = self._normalize_date_filter_config(date_filter_cfg)
         self.timing_data_enabled = bool(getattr(debug, "timing_data_enabled", False))
         self.timing_data_every = max(1, int(getattr(debug, "timing_data_every", 50)))
         self.timing_rank0_only = bool(getattr(debug, "timing_rank0_only", True))
@@ -331,6 +334,14 @@ class MultiDataset(IterableDataset):
                 msg = "No valid date indices found after intersection across all datasets."
                 raise ValueError(msg)
 
+            filter_dataset_name = self.date_filter.get("dataset") if self.date_filter is not None else None
+            if filter_dataset_name is None:
+                filter_dataset_name = self.dataset_names[0]
+            valid_date_indices_intersection = self._apply_date_filter(
+                valid_date_indices_intersection,
+                filter_dataset_name,
+            )
+
             LOGGER.info("MultiDataset has %d valid indices after intersection.", len(valid_date_indices_intersection))
             self._anchor_dataset_name = None
             return valid_date_indices_intersection
@@ -341,6 +352,8 @@ class MultiDataset(IterableDataset):
             msg = f"Anchor dataset '{anchor_dataset_name}' has no valid date indices."
             raise ValueError(msg)
 
+        anchor_valid_indices = self._apply_date_filter(anchor_valid_indices, anchor_dataset_name)
+
         LOGGER.info(
             "MultiDataset using sparse time-index mode '%s' with anchor dataset '%s': %d valid indices.",
             mode,
@@ -349,6 +362,149 @@ class MultiDataset(IterableDataset):
         )
         self._anchor_dataset_name = anchor_dataset_name
         return anchor_valid_indices
+
+    @staticmethod
+    def _config_get(config: dict | None, key: str, default=None):
+        if config is None:
+            return default
+        if hasattr(config, "get"):
+            return config.get(key, default)
+        return getattr(config, key, default)
+
+    def _normalize_date_filter_config(self, config: dict | None) -> dict | None:
+        if config is None:
+            return None
+
+        windows_path = self._config_get(config, "windows_path", None)
+        timestamps_path = self._config_get(config, "timestamps_path", None)
+        path = self._config_get(config, "path", None)
+        mode = str(self._config_get(config, "mode", "")).strip().lower()
+        if path is not None:
+            if mode == "windows" or str(path).endswith(".tsv"):
+                windows_path = path
+            else:
+                timestamps_path = path
+        if windows_path is None and timestamps_path is None:
+            raise ValueError("`debug.date_filter` requires `windows_path`, `timestamps_path`, or `path`.")
+        if windows_path is not None and timestamps_path is not None:
+            raise ValueError("`debug.date_filter` accepts only one of `windows_path` and `timestamps_path`.")
+
+        dataset_name = self._config_get(config, "dataset", None)
+        if dataset_name is not None:
+            dataset_name = str(dataset_name)
+            if dataset_name not in self.dataset_names:
+                raise ValueError(
+                    f"`debug.date_filter.dataset` '{dataset_name}' is not in datasets: {self.dataset_names}"
+                )
+
+        return {
+            "dataset": dataset_name,
+            "windows_path": None if windows_path is None else os.path.expandvars(os.path.expanduser(str(windows_path))),
+            "timestamps_path": None
+            if timestamps_path is None
+            else os.path.expandvars(os.path.expanduser(str(timestamps_path))),
+            "radius_minutes": float(self._config_get(config, "radius_minutes", 0.0)),
+            "_windows_ns": None,
+        }
+
+    def _apply_date_filter(self, valid_date_indices: np.ndarray, dataset_name: str) -> np.ndarray:
+        if self.date_filter is None:
+            return valid_date_indices
+
+        configured_dataset = self.date_filter.get("dataset")
+        if configured_dataset is not None and configured_dataset != dataset_name:
+            raise ValueError(
+                f"`debug.date_filter.dataset` is '{configured_dataset}', but valid indices are for '{dataset_name}'."
+            )
+
+        dates_ns = self._dates_ns_by_dataset.get(dataset_name)
+        if dates_ns is None:
+            raise ValueError(f"Dataset '{dataset_name}' has no datetime index available for `debug.date_filter`.")
+
+        windows = self._date_filter_windows_ns()
+        candidate_dates_ns = dates_ns[valid_date_indices]
+        window_indices = np.searchsorted(windows["start"], candidate_dates_ns, side="right") - 1
+        keep = window_indices >= 0
+        keep_positions = np.nonzero(keep)[0]
+        keep[keep_positions] = candidate_dates_ns[keep_positions] <= windows["end"][window_indices[keep_positions]]
+        filtered = valid_date_indices[keep]
+        if len(filtered) == 0:
+            raise ValueError(
+                f"Date filter selected no valid indices for dataset '{dataset_name}' "
+                f"from {self._date_filter_source_for_log()}."
+            )
+
+        LOGGER.info(
+            "Date filter selected %d/%d valid indices for dataset '%s' from %s.",
+            len(filtered),
+            len(valid_date_indices),
+            dataset_name,
+            self._date_filter_source_for_log(),
+        )
+        return filtered
+
+    def _date_filter_windows_ns(self) -> dict[str, np.ndarray]:
+        cached = self.date_filter.get("_windows_ns")
+        if cached is not None:
+            return cached
+
+        starts: list[int] = []
+        ends: list[int] = []
+        windows_path = self.date_filter.get("windows_path")
+        if windows_path is not None:
+            with open(windows_path, newline="") as f:
+                reader = csv.DictReader(f, delimiter="\t")
+                for row in reader:
+                    start = str(row.get("start", "")).strip()
+                    end = str(row.get("end", "")).strip()
+                    if not start or not end:
+                        continue
+                    starts.append(self._datetime_to_unix_ns(start))
+                    ends.append(self._datetime_to_unix_ns(end))
+        else:
+            radius_ns = int(round(float(self.date_filter.get("radius_minutes", 0.0)) * 60.0 * 1_000_000_000))
+            with open(self.date_filter["timestamps_path"]) as f:
+                for line in f:
+                    value = line.split("#", 1)[0].strip()
+                    if not value:
+                        continue
+                    timestamp_ns = self._datetime_to_unix_ns(value)
+                    starts.append(timestamp_ns - radius_ns)
+                    ends.append(timestamp_ns + radius_ns)
+
+        if len(starts) == 0:
+            raise ValueError(f"Date filter source {self._date_filter_source_for_log()} contains no usable dates.")
+
+        windows = self._merge_date_windows_ns(np.asarray(starts, dtype=np.int64), np.asarray(ends, dtype=np.int64))
+        self.date_filter["_windows_ns"] = windows
+        return windows
+
+    @staticmethod
+    def _datetime_to_unix_ns(value: str) -> int:
+        return int(np.datetime64(value, "ns").astype(np.int64))
+
+    @staticmethod
+    def _merge_date_windows_ns(starts: np.ndarray, ends: np.ndarray) -> dict[str, np.ndarray]:
+        order = np.argsort(starts, kind="stable")
+        starts = starts[order]
+        ends = ends[order]
+        merged_starts = []
+        merged_ends = []
+        for start, end in zip(starts, ends, strict=True):
+            if end < start:
+                raise ValueError(f"Date filter window has end before start: {start} > {end}.")
+            if not merged_starts or int(start) > int(merged_ends[-1]) + 1:
+                merged_starts.append(int(start))
+                merged_ends.append(int(end))
+            elif int(end) > int(merged_ends[-1]):
+                merged_ends[-1] = int(end)
+        return {
+            "start": np.asarray(merged_starts, dtype=np.int64),
+            "end": np.asarray(merged_ends, dtype=np.int64),
+        }
+
+    def _date_filter_source_for_log(self) -> str:
+        return self.date_filter.get("windows_path") or self.date_filter.get("timestamps_path")
 
     def _resolved_time_index_mode(self) -> str:
         if self.time_index_mode != "auto_sparse":

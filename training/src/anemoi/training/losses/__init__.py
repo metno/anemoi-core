@@ -13,6 +13,10 @@ from .kcrps import AlmostFairKernelCRPS
 from .kcrps import KernelCRPS
 from .kcrps import SampledNetatmoAlmostFairKernelCRPSOnRadarGridLoss
 from .kcrps import SampledGridPointAlmostFairKernelCRPS
+from .lightning import LightningActiveMaskLoss
+from .lightning import LightningSpatialTemporalAggregatedAlmostFairKernelCRPSLoss
+from .lightning import LightningSpatialTemporalAggregatedHuberLoss
+from .lightning import LightningTemporalIncrementHuberLoss
 from .logcosh import LogCoshLoss
 from .loss import get_loss_function
 from .mae import MAELoss
@@ -42,6 +46,10 @@ __all__ = [
     "FourierCorrelationLoss",
     "HuberLoss",
     "KernelCRPS",
+    "LightningActiveMaskLoss",
+    "LightningSpatialTemporalAggregatedAlmostFairKernelCRPSLoss",
+    "LightningSpatialTemporalAggregatedHuberLoss",
+    "LightningTemporalIncrementHuberLoss",
     "LogCoshLoss",
     "LogFFT2Distance",
     "LogSpectralDistance",

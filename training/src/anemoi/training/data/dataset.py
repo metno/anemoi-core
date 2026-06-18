@@ -90,7 +90,9 @@ class BaseAnemoiReader:
         if source is None:
             msg = "Either dataset or dataset_config must be provided."
             raise ValueError(msg)
-        self.data = open_dataset(_normalize_dataset_config(source), start=start, end=end)
+        source = _normalize_dataset_config(source)
+        self._configured_frequency = source.get("frequency") if isinstance(source, dict) else None
+        self.data = open_dataset(source, start=start, end=end)
 
     @property
     def dates(self) -> np.ndarray:
@@ -140,7 +142,12 @@ class BaseAnemoiReader:
     @property
     def frequency(self) -> datetime.timedelta:
         """Return dataset frequency."""
-        return self.data.frequency
+        try:
+            return self.data.frequency
+        except ValueError:
+            if self._configured_frequency is None:
+                raise
+            return datetime.timedelta(seconds=frequency_to_seconds(self._configured_frequency))
 
     @property
     def supporting_arrays(self) -> dict:

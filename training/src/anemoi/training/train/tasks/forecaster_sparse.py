@@ -225,15 +225,59 @@ class GraphForecasterSparse(BaseRolloutGraphModule):
 
         return int(time_map[sampled_time])
 
+    def _update_rollout_prediction_cache(
+        self,
+        prediction_cache: dict[str, dict[int, torch.Tensor]],
+        y_pred_full: dict[str, torch.Tensor],
+        *,
+        rollout_step: int,
+    ) -> None:
+        """Store all predicted prognostic states by dataset and relative time.
+
+        Sparse rollout inputs can overlap several previous output windows when
+        ``multistep_input > multistep_output``. Keeping only the immediately
+        previous prediction window would reintroduce truth from ``batch`` for
+        older overlapping times. This cache makes every already-predicted
+        prognostic time available to later rollout inputs.
+        """
+        for dataset_name, dataset_prediction in y_pred_full.items():
+            if dataset_name not in self.data_indices:
+                continue
+
+            pred_start, pred_end = self._prediction_window_for_step(
+                dataset_name=dataset_name,
+                rollout_step=rollout_step,
+            )
+            dataset_cache = prediction_cache.setdefault(dataset_name, {})
+            prognostic_index = self.data_indices[dataset_name].model.output.prognostic
+
+            for pred_position, relative_time in enumerate(range(pred_start, pred_end + 1)):
+                dataset_cache[int(relative_time)] = dataset_prediction[
+                    :,
+                    pred_position,
+                    ...,
+                    prognostic_index,
+                ]
+
+    def _cached_prediction_for_relative_time(
+        self,
+        prediction_cache: dict[str, dict[int, torch.Tensor]],
+        *,
+        dataset_name: str,
+        relative_time: int,
+    ) -> torch.Tensor | None:
+        return prediction_cache.get(dataset_name, {}).get(int(relative_time), None)
+
     def _build_rollout_input_step(
         self,
         *,
         dataset_name: str,
         dataset_batch: torch.Tensor,
-        y_pred_full: dict[str, torch.Tensor],
+        prediction_cache: dict[str, dict[int, torch.Tensor]],
         relative_time: int,
         rollout_step: int,
     ) -> torch.Tensor:
+        del rollout_step
         batch_position = self._sample_batch_position(dataset_name=dataset_name, relative_time=relative_time)
         x_step = dataset_batch[
             :,
@@ -242,16 +286,13 @@ class GraphForecasterSparse(BaseRolloutGraphModule):
             self.data_indices[dataset_name].data.input.full,
         ].clone()
 
-        pred_start, pred_end = self._prediction_window_for_step(dataset_name=dataset_name, rollout_step=rollout_step)
-        pred_position = int(relative_time - pred_start)
-        has_prediction = pred_start <= int(relative_time) <= pred_end and dataset_name in y_pred_full
-        if has_prediction:
-            x_step[..., self.data_indices[dataset_name].model.input.prognostic] = y_pred_full[dataset_name][
-                :,
-                pred_position,
-                ...,
-                self.data_indices[dataset_name].model.output.prognostic,
-            ]
+        cached_prediction = self._cached_prediction_for_relative_time(
+            prediction_cache,
+            dataset_name=dataset_name,
+            relative_time=relative_time,
+        )
+        if cached_prediction is not None:
+            x_step[..., self.data_indices[dataset_name].model.input.prognostic] = cached_prediction
 
         x_step = self.output_mask[dataset_name].rollout_boundary(
             x_step,
@@ -271,7 +312,7 @@ class GraphForecasterSparse(BaseRolloutGraphModule):
     def _advance_input(
         self,
         x: dict[str, torch.Tensor],
-        y_pred: dict[str, torch.Tensor],
+        prediction_cache: dict[str, dict[int, torch.Tensor]],
         batch: dict[str, torch.Tensor],
         rollout_step: int,
     ) -> dict[str, torch.Tensor]:
@@ -286,7 +327,7 @@ class GraphForecasterSparse(BaseRolloutGraphModule):
                 self._build_rollout_input_step(
                     dataset_name=dataset_name,
                     dataset_batch=dataset_batch,
-                    y_pred_full=y_pred,
+                    prediction_cache=prediction_cache,
                     relative_time=relative_time,
                     rollout_step=rollout_step,
                 )
@@ -332,8 +373,15 @@ class GraphForecasterSparse(BaseRolloutGraphModule):
             x_time = dataset_batch.index_select(1, input_index)
             x[dataset_name] = x_time[..., self.data_indices[dataset_name].data.input.full]
 
+        prediction_cache: dict[str, dict[int, torch.Tensor]] = {}
+
         for rollout_step in range(rollout_steps):
             y_pred_full = self(x)
+            self._update_rollout_prediction_cache(
+                prediction_cache,
+                y_pred_full,
+                rollout_step=rollout_step,
+            )
             y_pred = {}
             y = {}
             for dataset_name, dataset_batch in batch.items():
@@ -367,7 +415,7 @@ class GraphForecasterSparse(BaseRolloutGraphModule):
             )
 
             if rollout_step < rollout_steps - 1:
-                x = self._advance_input(x, y_pred_full, batch, rollout_step=rollout_step)
+                x = self._advance_input(x, prediction_cache, batch, rollout_step=rollout_step)
 
             yield loss, metrics_next, y_pred
 
@@ -485,10 +533,11 @@ class GraphEnsForecasterSparse(GraphForecasterSparse):
         *,
         dataset_name: str,
         dataset_batch: torch.Tensor,
-        y_pred_full: dict[str, torch.Tensor],
+        prediction_cache: dict[str, dict[int, torch.Tensor]],
         relative_time: int,
         rollout_step: int,
     ) -> torch.Tensor:
+        del rollout_step
         batch_position = self._sample_batch_position(dataset_name=dataset_name, relative_time=relative_time)
         x_step = dataset_batch[
             :,
@@ -500,16 +549,13 @@ class GraphEnsForecasterSparse(GraphForecasterSparse):
         if self.nens_per_device > 1:
             x_step = torch.cat([x_step] * self.nens_per_device, dim=1)
 
-        pred_start, pred_end = self._prediction_window_for_step(dataset_name=dataset_name, rollout_step=rollout_step)
-        pred_position = int(relative_time - pred_start)
-        has_prediction = pred_start <= int(relative_time) <= pred_end and dataset_name in y_pred_full
-        if has_prediction:
-            x_step[..., self.data_indices[dataset_name].model.input.prognostic] = y_pred_full[dataset_name][
-                :,
-                pred_position,
-                ...,
-                self.data_indices[dataset_name].model.output.prognostic,
-            ]
+        cached_prediction = self._cached_prediction_for_relative_time(
+            prediction_cache,
+            dataset_name=dataset_name,
+            relative_time=relative_time,
+        )
+        if cached_prediction is not None:
+            x_step[..., self.data_indices[dataset_name].model.input.prognostic] = cached_prediction
 
         boundary = dataset_batch[:, batch_position]
         if self.nens_per_device > 1:
@@ -564,8 +610,15 @@ class GraphEnsForecasterSparse(GraphForecasterSparse):
                 f"got ({x[dataset_name].shape[1]}, {x[dataset_name].shape[2]})!"
             )
 
+        prediction_cache: dict[str, dict[int, torch.Tensor]] = {}
+
         for rollout_step in range(rollout_steps):
             y_pred_full = self(x, fcstep=rollout_step)
+            self._update_rollout_prediction_cache(
+                prediction_cache,
+                y_pred_full,
+                rollout_step=rollout_step,
+            )
             y_pred = {}
             y = {}
             for dataset_name, dataset_batch in batch.items():
@@ -599,6 +652,6 @@ class GraphEnsForecasterSparse(GraphForecasterSparse):
             )
 
             if rollout_step < rollout_steps - 1:
-                x = self._advance_input(x, y_pred_full, batch, rollout_step=rollout_step)
+                x = self._advance_input(x, prediction_cache, batch, rollout_step=rollout_step)
 
             yield loss, metrics_next, y_pred_ens

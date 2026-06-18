@@ -117,6 +117,8 @@ class AlmostFairKernelCRPS(BaseLoss):
         alpha_scaler_name: str | None = None,
         no_autocast: bool = True,
         ignore_nans: bool = False,
+        log_total_counts: bool = False,
+        log_total_counts_label: str = "count",
         **kwargs,  # noqa: ARG002
     ) -> None:
         """Latitude- and (inverse-)variance-weighted kernel CRPS loss.
@@ -139,6 +141,9 @@ class AlmostFairKernelCRPS(BaseLoss):
         self.alpha = alpha
         self.alpha_scaler_name = alpha_scaler_name
         self.no_autocast = no_autocast
+        self.log_total_counts = bool(log_total_counts)
+        self.log_total_counts_label = log_total_counts_label
+        self._log_total_counts_calls = 0
 
     def _kernel_crps(self, preds: torch.Tensor, targets: torch.Tensor, alpha: float | torch.Tensor = 1.0) -> torch.Tensor:
         """Kernel (ensemble) CRPS.
@@ -194,6 +199,28 @@ class AlmostFairKernelCRPS(BaseLoss):
         **kwargs,  # noqa: ARG002
     ) -> torch.Tensor:
         is_sharded = grid_shard_slice is not None
+
+        if self.log_total_counts:
+            self._log_total_counts_calls += 1
+            pred_totals = torch.nansum(y_pred.detach().float(), dim=(0, 1, 3, 4))
+            target_total = torch.nansum(y_target.detach().float())
+            if is_sharded and group is not None:
+                pred_totals = reduce_tensor(pred_totals, group)
+                target_total = reduce_tensor(target_total, group)
+            rank = 0
+            if torch.distributed.is_available() and torch.distributed.is_initialized():
+                rank = torch.distributed.get_rank()
+            if rank == 0:
+                LOGGER.info(
+                    "%s total count call %d dataset=%s pred_mean=%.6g pred_min=%.6g pred_max=%.6g target=%.6g",
+                    self.log_total_counts_label,
+                    self._log_total_counts_calls,
+                    kwargs.get("dataset_name", "unknown"),
+                    pred_totals.mean().item(),
+                    pred_totals.min().item(),
+                    pred_totals.max().item(),
+                    target_total.item(),
+                )
 
         y_target = einops.rearrange(y_target, "bs t latlon v -> bs t v latlon")
         y_pred = einops.rearrange(y_pred, "bs t e latlon v -> bs t v latlon e")

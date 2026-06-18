@@ -7,6 +7,8 @@
 # granted to it by virtue of its status as an intergovernmental organisation
 # nor does it submit to any jurisdiction.
 
+from contextlib import nullcontext
+
 import torch
 import torch.nn.functional as F
 from torch.distributed.distributed_c10d import ProcessGroup
@@ -29,6 +31,7 @@ class SSIMLoss(BaseLoss):
         k2: float = 0.03,
         eps: float = 1.0e-6,
         ignore_nans: bool = False,
+        no_autocast: bool = False,
     ) -> None:
         super().__init__(ignore_nans=ignore_nans)
         if window_size <= 0 or window_size % 2 == 0:
@@ -41,6 +44,7 @@ class SSIMLoss(BaseLoss):
         self.k1 = float(k1)
         self.k2 = float(k2)
         self.eps = float(eps)
+        self.no_autocast = bool(no_autocast)
         self.supports_sharding = False
 
     def _to_maps(self, x: torch.Tensor) -> torch.Tensor:
@@ -82,30 +86,44 @@ class SSIMLoss(BaseLoss):
         pred_maps = self._to_maps(pred)
         target_maps = self._to_maps(target)
 
-        kernel = pred_maps.new_full((1, 1, self.window_size, self.window_size), 1.0 / (self.window_size**2))
-        pad = self.window_size // 2
+        if self.no_autocast:
+            pred_maps = pred_maps.float()
+            target_maps = target_maps.float()
+        autocast_context = (
+            torch.amp.autocast(device_type="cuda", enabled=False)
+            if self.no_autocast and pred_maps.is_cuda
+            else nullcontext()
+        )
+        with autocast_context:
+            pad = self.window_size // 2
 
-        mu_pred = F.conv2d(pred_maps, kernel, padding=pad)
-        mu_target = F.conv2d(target_maps, kernel, padding=pad)
+            mu_pred = F.avg_pool2d(pred_maps, self.window_size, stride=1, padding=pad, count_include_pad=True)
+            mu_target = F.avg_pool2d(target_maps, self.window_size, stride=1, padding=pad, count_include_pad=True)
 
-        sigma_pred = F.conv2d(pred_maps * pred_maps, kernel, padding=pad) - mu_pred.square()
-        sigma_target = F.conv2d(target_maps * target_maps, kernel, padding=pad) - mu_target.square()
-        sigma_cross = F.conv2d(pred_maps * target_maps, kernel, padding=pad) - mu_pred * mu_target
+            sigma_pred = F.avg_pool2d(
+                pred_maps * pred_maps, self.window_size, stride=1, padding=pad, count_include_pad=True
+            ) - mu_pred.square()
+            sigma_target = F.avg_pool2d(
+                target_maps * target_maps, self.window_size, stride=1, padding=pad, count_include_pad=True
+            ) - mu_target.square()
+            sigma_cross = F.avg_pool2d(
+                pred_maps * target_maps, self.window_size, stride=1, padding=pad, count_include_pad=True
+            ) - mu_pred * mu_target
 
-        sigma_pred = torch.clamp(sigma_pred, min=0.0)
-        sigma_target = torch.clamp(sigma_target, min=0.0)
+            sigma_pred = torch.clamp(sigma_pred, min=0.0)
+            sigma_target = torch.clamp(sigma_target, min=0.0)
 
-        dynamic_max = torch.maximum(pred_maps, target_maps).amax(dim=(-2, -1), keepdim=True)
-        dynamic_min = torch.minimum(pred_maps, target_maps).amin(dim=(-2, -1), keepdim=True)
-        data_range = (dynamic_max - dynamic_min).clamp_min(self.eps)
+            dynamic_max = torch.maximum(pred_maps, target_maps).amax(dim=(-2, -1), keepdim=True)
+            dynamic_min = torch.minimum(pred_maps, target_maps).amin(dim=(-2, -1), keepdim=True)
+            data_range = (dynamic_max - dynamic_min).clamp_min(self.eps)
 
-        c1 = (self.k1 * data_range).square()
-        c2 = (self.k2 * data_range).square()
+            c1 = (self.k1 * data_range).square()
+            c2 = (self.k2 * data_range).square()
 
-        numerator = (2.0 * mu_pred * mu_target + c1) * (2.0 * sigma_cross + c2)
-        denominator = (mu_pred.square() + mu_target.square() + c1) * (sigma_pred + sigma_target + c2)
-        ssim_map = numerator / (denominator + self.eps)
-        loss_map = torch.clamp((1.0 - ssim_map) * 0.5, min=0.0)
+            numerator = (2.0 * mu_pred * mu_target + c1) * (2.0 * sigma_cross + c2)
+            denominator = (mu_pred.square() + mu_target.square() + c1) * (sigma_pred + sigma_target + c2)
+            ssim_map = numerator / (denominator + self.eps)
+            loss_map = torch.clamp((1.0 - ssim_map) * 0.5, min=0.0)
 
         out = self._from_maps(loss_map, pred)
         out = self.scale(out, scaler_indices, without_scalers=without_scalers, grid_shard_slice=grid_shard_slice)
@@ -174,6 +192,7 @@ class MaskedLogSSIMLoss(SSIMLoss):
         log_scale: float = 1.0,
         normalise_by_mask: bool = True,
         ignore_nans: bool = False,
+        no_autocast: bool = False,
     ) -> None:
         super().__init__(
             x_dim=x_dim,
@@ -183,6 +202,7 @@ class MaskedLogSSIMLoss(SSIMLoss):
             k2=k2,
             eps=eps,
             ignore_nans=ignore_nans,
+            no_autocast=no_autocast,
         )
         if rain_threshold < 0:
             raise ValueError(f"rain_threshold must be non-negative, got {rain_threshold}")
@@ -236,30 +256,44 @@ class MaskedLogSSIMLoss(SSIMLoss):
         pred_maps = torch.log1p(raw_pred_maps * self.log_scale)
         target_maps = torch.log1p(raw_target_maps * self.log_scale)
 
-        kernel = pred_maps.new_full((1, 1, self.window_size, self.window_size), 1.0 / (self.window_size**2))
-        pad = self.window_size // 2
+        if self.no_autocast:
+            pred_maps = pred_maps.float()
+            target_maps = target_maps.float()
+        autocast_context = (
+            torch.amp.autocast(device_type="cuda", enabled=False)
+            if self.no_autocast and pred_maps.is_cuda
+            else nullcontext()
+        )
+        with autocast_context:
+            pad = self.window_size // 2
 
-        mu_pred = F.conv2d(pred_maps, kernel, padding=pad)
-        mu_target = F.conv2d(target_maps, kernel, padding=pad)
+            mu_pred = F.avg_pool2d(pred_maps, self.window_size, stride=1, padding=pad, count_include_pad=True)
+            mu_target = F.avg_pool2d(target_maps, self.window_size, stride=1, padding=pad, count_include_pad=True)
 
-        sigma_pred = F.conv2d(pred_maps * pred_maps, kernel, padding=pad) - mu_pred.square()
-        sigma_target = F.conv2d(target_maps * target_maps, kernel, padding=pad) - mu_target.square()
-        sigma_cross = F.conv2d(pred_maps * target_maps, kernel, padding=pad) - mu_pred * mu_target
+            sigma_pred = F.avg_pool2d(
+                pred_maps * pred_maps, self.window_size, stride=1, padding=pad, count_include_pad=True
+            ) - mu_pred.square()
+            sigma_target = F.avg_pool2d(
+                target_maps * target_maps, self.window_size, stride=1, padding=pad, count_include_pad=True
+            ) - mu_target.square()
+            sigma_cross = F.avg_pool2d(
+                pred_maps * target_maps, self.window_size, stride=1, padding=pad, count_include_pad=True
+            ) - mu_pred * mu_target
 
-        sigma_pred = torch.clamp(sigma_pred, min=0.0)
-        sigma_target = torch.clamp(sigma_target, min=0.0)
+            sigma_pred = torch.clamp(sigma_pred, min=0.0)
+            sigma_target = torch.clamp(sigma_target, min=0.0)
 
-        dynamic_max = torch.maximum(pred_maps, target_maps).amax(dim=(-2, -1), keepdim=True)
-        dynamic_min = torch.minimum(pred_maps, target_maps).amin(dim=(-2, -1), keepdim=True)
-        data_range = (dynamic_max - dynamic_min).clamp_min(self.eps)
+            dynamic_max = torch.maximum(pred_maps, target_maps).amax(dim=(-2, -1), keepdim=True)
+            dynamic_min = torch.minimum(pred_maps, target_maps).amin(dim=(-2, -1), keepdim=True)
+            data_range = (dynamic_max - dynamic_min).clamp_min(self.eps)
 
-        c1 = (self.k1 * data_range).square()
-        c2 = (self.k2 * data_range).square()
+            c1 = (self.k1 * data_range).square()
+            c2 = (self.k2 * data_range).square()
 
-        numerator = (2.0 * mu_pred * mu_target + c1) * (2.0 * sigma_cross + c2)
-        denominator = (mu_pred.square() + mu_target.square() + c1) * (sigma_pred + sigma_target + c2)
-        ssim_map = numerator / (denominator + self.eps)
-        loss_map = torch.clamp((1.0 - ssim_map) * 0.5, min=0.0)
+            numerator = (2.0 * mu_pred * mu_target + c1) * (2.0 * sigma_cross + c2)
+            denominator = (mu_pred.square() + mu_target.square() + c1) * (sigma_pred + sigma_target + c2)
+            ssim_map = numerator / (denominator + self.eps)
+            loss_map = torch.clamp((1.0 - ssim_map) * 0.5, min=0.0)
 
         mask_maps = self._rain_mask(raw_pred_maps, raw_target_maps)
         if valid is not None:
