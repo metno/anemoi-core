@@ -102,7 +102,9 @@ class BaseRolloutGraphModule(BaseGraphModule, ABC):
         Supports model outputs shaped like:
         - (B, T, E, G, V)
         """
-        keep_steps = min(self.n_step_output, self.n_step_input)
+        keep_steps = min(self.n_step_output, x.shape[1])
+        if keep_steps == 0:
+            return x
 
         x = x.roll(-keep_steps, dims=1)
 

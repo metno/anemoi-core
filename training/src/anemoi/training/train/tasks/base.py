@@ -1151,10 +1151,10 @@ class BaseGraphModule(pl.LightningModule, ABC):
             loss_weight = component_weights.get(dataset_name, {}).get(component_name)
             if total_value is not None and total_value != 0:
                 if loss_weight is None:
-                    LOGGER.info("Relative contribution metric %s: %.2f%%", label, 100.0 * component_value / total_value)
+                    LOGGER.info("Relative contribution metric %s: %.4f%%", label, 100.0 * component_value / total_value)
                 else:
                     LOGGER.info(
-                        "Relative contribution metric %s for loss weight %.6g: %.2f%%",
+                        "Relative contribution metric %s for loss weight %.6g: %.4f%%",
                         label,
                         loss_weight,
                         100.0 * component_value / total_value,
@@ -1162,10 +1162,10 @@ class BaseGraphModule(pl.LightningModule, ABC):
             if global_component_total == 0:
                 continue
             if loss_weight is None:
-                LOGGER.info("Global contribution metric %s: %.2f%%", label, 100.0 * component_value / global_component_total)
+                LOGGER.info("Global contribution metric %s: %.4f%%", label, 100.0 * component_value / global_component_total)
                 continue
             LOGGER.info(
-                "Global contribution metric %s for loss weight %.6g: %.2f%%",
+                "Global contribution metric %s for loss weight %.6g: %.4f%%",
                 label,
                 loss_weight,
                 100.0 * component_value / global_component_total,

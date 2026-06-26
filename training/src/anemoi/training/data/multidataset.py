@@ -199,10 +199,6 @@ class MultiDataset(IterableDataset):
 
             input_indices = np.array(sorted({int(value) for value in raw_input}), dtype=np.int64)
             target_indices = np.array(sorted({int(value) for value in raw_target}), dtype=np.int64)
-            if len(input_indices) == 0:
-                raise ValueError(
-                    f"Explicit time indices for dataset '{dataset_name}' require a non-empty `input`."
-                )
             if np.any(input_indices < 0) or np.any(target_indices < 0):
                 raise ValueError(
                     f"Explicit time indices for dataset '{dataset_name}' must be non-negative."

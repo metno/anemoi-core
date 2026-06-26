@@ -87,6 +87,11 @@ class GraphForecasterSparse(BaseRolloutGraphModule):
                 self.dataset_target_relative_time_indices[dataset_name],
             )
 
+        self._shared_input_anchor_time = max(
+            (max(input_times) for input_times in self.dataset_input_relative_time_indices.values() if len(input_times) > 0),
+            default=-1,
+        )
+
     def _resolve_dataset_time_indices(
         self,
         *,
@@ -131,7 +136,7 @@ class GraphForecasterSparse(BaseRolloutGraphModule):
                 raw_indices = input_by_dataset.get(dataset_name, None)
                 if isinstance(raw_indices, (list, tuple, ListConfig)):
                     input_indices = [int(v) for v in raw_indices]
-            if not input_indices:
+            if input_indices is None:
                 input_indices = [int(v) for v in fallback_input_indices]
 
             target_indices = None
@@ -175,11 +180,12 @@ class GraphForecasterSparse(BaseRolloutGraphModule):
         return positions
 
     def _prediction_window_for_step(self, *, dataset_name: str, rollout_step: int) -> tuple[int, int]:
-        input_relative_times = self.dataset_input_relative_time_indices[dataset_name]
-        anchor_time = max(input_relative_times) + rollout_step * self.n_step_output
+        anchor_time = self._shared_input_anchor_time + rollout_step * self.n_step_output
         return anchor_time + 1, anchor_time + self.n_step_output
 
     def _next_input_relative_times(self, *, dataset_name: str, rollout_step: int) -> list[int]:
+        if len(self.dataset_input_relative_time_indices[dataset_name]) == 0:
+            return []
         shift = (rollout_step + 1) * self.n_step_output
         return [int(relative_time + shift) for relative_time in self.dataset_input_relative_time_indices[dataset_name]]
 
@@ -240,8 +246,15 @@ class GraphForecasterSparse(BaseRolloutGraphModule):
         older overlapping times. This cache makes every already-predicted
         prognostic time available to later rollout inputs.
         """
+        empty_input_datasets = {
+            dataset_name
+            for dataset_name, input_times in self.dataset_input_relative_time_indices.items()
+            if len(input_times) == 0
+        }
         for dataset_name, dataset_prediction in y_pred_full.items():
             if dataset_name not in self.data_indices:
+                continue
+            if dataset_name in empty_input_datasets:
                 continue
 
             pred_start, pred_end = self._prediction_window_for_step(
@@ -323,6 +336,9 @@ class GraphForecasterSparse(BaseRolloutGraphModule):
                 dataset_name=dataset_name,
                 rollout_step=rollout_step,
             )
+            if len(next_input_relative_times) == 0:
+                next_x[dataset_name] = dataset_batch[:, :0, ..., self.data_indices[dataset_name].data.input.full]
+                continue
             next_steps = [
                 self._build_rollout_input_step(
                     dataset_name=dataset_name,
@@ -337,9 +353,8 @@ class GraphForecasterSparse(BaseRolloutGraphModule):
         return next_x
 
     def _rollout_targets_for_step(self, *, dataset_name: str, rollout_step: int) -> tuple[list[int], list[int]]:
-        input_relative_times = self.dataset_input_relative_time_indices[dataset_name]
         target_relative_times = self.dataset_target_relative_time_indices[dataset_name]
-        anchor_time = max(input_relative_times) + rollout_step * self.n_step_output
+        anchor_time = self._shared_input_anchor_time + rollout_step * self.n_step_output
         step_start = anchor_time + 1
         step_end = anchor_time + self.n_step_output
         step_target_relative_times = [
@@ -348,9 +363,7 @@ class GraphForecasterSparse(BaseRolloutGraphModule):
             if step_start <= int(relative_time) <= step_end
         ]
         if len(step_target_relative_times) == 0:
-            raise ValueError(
-                f"Dataset '{dataset_name}' has no target times in rollout window [{step_start}, {step_end}]."
-            )
+            return [], []
         pred_positions = [int(relative_time - step_start) for relative_time in step_target_relative_times]
         return step_target_relative_times, pred_positions
 
@@ -369,6 +382,9 @@ class GraphForecasterSparse(BaseRolloutGraphModule):
                 dataset_name=dataset_name,
                 relative_times=self.dataset_input_relative_time_indices[dataset_name],
             )
+            if len(input_positions) == 0:
+                x[dataset_name] = dataset_batch[:, :0, ..., self.data_indices[dataset_name].data.input.full]
+                continue
             input_index = torch.tensor(input_positions, device=dataset_batch.device, dtype=torch.long)
             x_time = dataset_batch.index_select(1, input_index)
             x[dataset_name] = x_time[..., self.data_indices[dataset_name].data.input.full]
@@ -594,11 +610,16 @@ class GraphEnsForecasterSparse(GraphForecasterSparse):
                 dataset_name=dataset_name,
                 relative_times=self.dataset_input_relative_time_indices[dataset_name],
             )
+            if len(input_positions) == 0:
+                x[dataset_name] = dataset_batch[:, :0, ..., self.data_indices[dataset_name].data.input.full]
+                continue
             input_index = torch.tensor(input_positions, device=dataset_batch.device, dtype=torch.long)
             x_time = dataset_batch.index_select(1, input_index)
             x[dataset_name] = x_time[..., self.data_indices[dataset_name].data.input.full]
 
         for dataset_name in self.dataset_names:
+            if x[dataset_name].shape[1] == 0:
+                continue
             x[dataset_name] = torch.cat([x[dataset_name]] * self.nens_per_device, dim=2)
             LOGGER.debug("Shapes: x[%s].shape = %s", dataset_name, list(x[dataset_name].shape))
             assert (

@@ -71,6 +71,9 @@ class SkipConnection(BaseResidualConnection):
         n_step_output: int | None = None,
     ) -> torch.Tensor:
         """Return the last timestep of the input sequence."""
+        if x.shape[1] == 0:
+            output_steps = n_step_output if n_step_output is not None else 0
+            return x.new_zeros((x.shape[0], output_steps, x.shape[2], x.shape[3], x.shape[4]))
         x_skip = x[:, self.step, ...]  # x shape: (batch, time, ens, nodes, features)
         return self._expand_time(x_skip, n_step_output)
 

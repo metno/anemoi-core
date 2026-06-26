@@ -430,13 +430,17 @@ class AnemoiTrainer(ABC):
     def _log_information(self) -> None:
         # Log number of variables (features) per dataset
         for dataset_name, data in self.datamodule.ds_train.data.items():
-            num_forcing_features = len(self.data_indices[dataset_name].forcing)
-            num_fc_features = len(data.variables) - num_forcing_features
-            LOGGER.info("Dataset '%s' - Total number of prognostic variables: %d", dataset_name, num_fc_features)
+            num_prognostic_features = len(self.data_indices[dataset_name].prognostic)
+            num_auxiliary_features = (
+                len(self.data_indices[dataset_name].forcing)
+                + len(self.data_indices[dataset_name].diagnostic)
+                + len(self.data_indices[dataset_name].target)
+            )
+            LOGGER.info("Dataset '%s' - Total number of prognostic variables: %d", dataset_name, num_prognostic_features)
             LOGGER.info(
                 "Dataset '%s' - Total number of auxiliary variables: %d",
                 dataset_name,
-                num_forcing_features,
+                num_auxiliary_features,
             )
 
         # Log learning rate multiplier when running single-node, multi-GPU and/or multi-node

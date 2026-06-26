@@ -132,10 +132,6 @@ class AnemoiDatasetsDataModule(pl.LightningDataModule):
 
             input_indices = [int(value) for value in raw_input]
             target_indices = [int(value) for value in raw_target]
-            if len(input_indices) == 0:
-                raise ValueError(
-                    f"`training.dataset_time_indices[{dataset_name}]` requires a non-empty `input` list."
-                )
 
             parsed[str(dataset_name)] = {"input": input_indices, "target": target_indices}
 

@@ -26,6 +26,7 @@ from anemoi.models.distributed.graph import shard_tensor
 from anemoi.models.distributed.shapes import get_or_apply_shard_shapes
 from anemoi.models.distributed.shapes import get_shard_shapes
 from anemoi.models.models import AnemoiModelEncProcDec
+from anemoi.models.layers.graph_provider import create_graph_provider
 from anemoi.models.preprocessing.qc_flags import QCDecodeBits
 from anemoi.models.preprocessing.qc_flags import QCFeaturizer
 from anemoi.models.preprocessing.qc_flags import QCPackedEmbedding
@@ -96,10 +97,6 @@ class AnemoiModelEncProcDecUnionDecoderForecaster(AnemoiModelEncProcDec):
                         f"`training.dataset_time_indices[{dataset_name}]` must define an `input` list."
                     )
                 input_indices = tuple(int(value) for value in raw_input)
-                if len(input_indices) == 0:
-                    raise ValueError(
-                        f"`training.dataset_time_indices[{dataset_name}]` requires a non-empty `input` list."
-                    )
                 self.dataset_input_time_indices[str(dataset_name)] = input_indices
 
         super().__init__(
@@ -143,6 +140,109 @@ class AnemoiModelEncProcDecUnionDecoderForecaster(AnemoiModelEncProcDec):
 
         node_attr = self.node_attributes.attr_ndims[dataset_name]
         return base + dataset_n_step_input * qc_extra + node_attr
+
+    def _build_networks(self, model_config: DotDict) -> None:
+        self.encoder_dataset_names = tuple(
+            dataset_name for dataset_name in self.dataset_names if self.num_input_channels[dataset_name] > 0
+        )
+
+        self.encoder_graph_provider = nn.ModuleDict()
+        self.encoder = nn.ModuleDict()
+        for dataset_name in self.encoder_dataset_names:
+            self.encoder_graph_provider[dataset_name] = create_graph_provider(
+                graph=self._graph_data[(dataset_name, "to", self._graph_name_hidden)],
+                edge_attributes=model_config.model.encoder.get("sub_graph_edge_attributes"),
+                src_size=self.node_attributes.num_nodes[dataset_name],
+                dst_size=self.node_attributes.num_nodes[self._graph_name_hidden],
+                trainable_size=model_config.model.encoder.get("trainable_size", 0),
+            )
+
+            self.encoder[dataset_name] = instantiate(
+                model_config.model.encoder,
+                _recursive_=False,  # Avoids instantiation of layer_kernels here
+                in_channels_src=self.input_dim[dataset_name],
+                in_channels_dst=self.node_attributes.attr_ndims[self._graph_name_hidden],
+                hidden_dim=self.num_channels,
+                edge_dim=self.encoder_graph_provider[dataset_name].edge_dim,
+            )
+
+        self.processor_graph_provider = create_graph_provider(
+            graph=self._graph_data[(self._graph_name_hidden, "to", self._graph_name_hidden)],
+            edge_attributes=model_config.model.processor.get("sub_graph_edge_attributes"),
+            src_size=self.node_attributes.num_nodes[self._graph_name_hidden],
+            dst_size=self.node_attributes.num_nodes[self._graph_name_hidden],
+            trainable_size=model_config.model.processor.get("trainable_size", 0),
+        )
+
+        self.processor = instantiate(
+            model_config.model.processor,
+            _recursive_=False,  # Avoids instantiation of layer_kernels here
+            num_channels=self.num_channels,
+            edge_dim=self.processor_graph_provider.edge_dim,
+        )
+
+        decoder_sel_cfg = DotDict(model_config.model.get("decoder_graph_selection", {}))
+        decoder_provider_cfg = DotDict(decoder_sel_cfg.get("provider_datasets", {}))
+        decoder_target_datasets = decoder_sel_cfg.get("target_datasets", None)
+        if decoder_target_datasets is None:
+            self.decoder_target_dataset_names = tuple(self.dataset_names)
+        else:
+            self.decoder_target_dataset_names = tuple(str(dataset_name) for dataset_name in decoder_target_datasets)
+            unknown_dataset_names = sorted(set(self.decoder_target_dataset_names).difference(self.dataset_names))
+            if unknown_dataset_names:
+                raise ValueError(
+                    f"decoder_graph_selection.target_datasets contains unknown datasets: {unknown_dataset_names}. "
+                    f"Known datasets: {self.dataset_names}"
+                )
+
+        self.decoder_provider_by_dataset = {
+            dataset_name: str(decoder_provider_cfg.get(dataset_name, dataset_name))
+            for dataset_name in self.decoder_target_dataset_names
+        }
+        self.decoder_graph_provider = torch.nn.ModuleDict()
+        self.decoder = torch.nn.ModuleDict()
+        self.decoder_template_dataset_by_provider: dict[str, str] = {}
+        for dataset_name in self.decoder_target_dataset_names:
+            provider_name = self.decoder_provider_by_dataset[dataset_name]
+            if provider_name not in self.node_attributes.num_nodes:
+                raise KeyError(
+                    f"Decoder provider '{provider_name}' for dataset '{dataset_name}' is not a graph node type. "
+                    f"Available node types: {list(self.node_attributes.num_nodes.keys())}"
+                )
+            provider_input_dim = (
+                self.input_dim[provider_name]
+                if provider_name in self.input_dim
+                else self.node_attributes.attr_ndims[provider_name]
+            )
+            if provider_name in self.decoder:
+                template_dataset = self.decoder_template_dataset_by_provider[provider_name]
+                if int(self.output_dim[dataset_name]) != int(self.output_dim[template_dataset]):
+                    raise ValueError(
+                        "Datasets mapped to the same decoder provider must share output dimensions: "
+                        f"{dataset_name}={self.output_dim[dataset_name]}, "
+                        f"{template_dataset}={self.output_dim[template_dataset]}, "
+                        f"provider={provider_name}"
+                    )
+                continue
+
+            self.decoder_graph_provider[provider_name] = create_graph_provider(
+                graph=self._graph_data[(self._graph_name_hidden, "to", provider_name)],
+                edge_attributes=model_config.model.decoder.get("sub_graph_edge_attributes"),
+                src_size=self.node_attributes.num_nodes[self._graph_name_hidden],
+                dst_size=self.node_attributes.num_nodes[provider_name],
+                trainable_size=model_config.model.decoder.get("trainable_size", 0),
+            )
+
+            self.decoder[provider_name] = instantiate(
+                model_config.model.decoder,
+                _recursive_=False,  # Avoids instantiation of layer_kernels here
+                in_channels_src=self.num_channels,
+                in_channels_dst=provider_input_dim,
+                hidden_dim=self.num_channels,
+                out_channels_dst=self.output_dim[dataset_name],
+                edge_dim=self.decoder_graph_provider[provider_name].edge_dim,
+            )
+            self.decoder_template_dataset_by_provider[provider_name] = dataset_name
 
     def _apply_station_dropout(self, x: torch.Tensor, *, dataset_name: str) -> torch.Tensor:
         if (
@@ -310,27 +410,29 @@ class AnemoiModelEncProcDecUnionDecoderForecaster(AnemoiModelEncProcDec):
             x_skip_dict[dataset_name] = x_skip
             shard_shapes_data_dict[dataset_name] = shard_shapes_data
 
-            encoder_edge_attr, encoder_edge_index, enc_edge_shard_shapes = self.encoder_graph_provider[
-                dataset_name
-            ].get_edges(
-                batch_size=batch_size,
-                model_comm_group=model_comm_group,
-            )
+            if dataset_name in self.encoder:
+                encoder_edge_attr, encoder_edge_index, enc_edge_shard_shapes = self.encoder_graph_provider[
+                    dataset_name
+                ].get_edges(
+                    batch_size=batch_size,
+                    model_comm_group=model_comm_group,
+                )
 
-            x_data_latent, x_latent = self.encoder[dataset_name](
-                (x_data_latent, x_hidden_latent),
-                batch_size=batch_size,
-                shard_shapes=(shard_shapes_data, shard_shapes_hidden_dict[dataset_name]),
-                edge_attr=encoder_edge_attr,
-                edge_index=encoder_edge_index,
-                model_comm_group=model_comm_group,
-                x_src_is_sharded=in_out_sharded[dataset_name],
-                x_dst_is_sharded=False,
-                keep_x_dst_sharded=True,
-                edge_shard_shapes=enc_edge_shard_shapes,
-            )
+                x_data_latent, x_latent = self.encoder[dataset_name](
+                    (x_data_latent, x_hidden_latent),
+                    batch_size=batch_size,
+                    shard_shapes=(shard_shapes_data, shard_shapes_hidden_dict[dataset_name]),
+                    edge_attr=encoder_edge_attr,
+                    edge_index=encoder_edge_index,
+                    model_comm_group=model_comm_group,
+                    x_src_is_sharded=in_out_sharded[dataset_name],
+                    x_dst_is_sharded=False,
+                    keep_x_dst_sharded=True,
+                    edge_shard_shapes=enc_edge_shard_shapes,
+                )
+                dataset_latents[dataset_name] = x_latent
+
             x_data_latent_dict[dataset_name] = x_data_latent
-            dataset_latents[dataset_name] = x_latent
 
         x_latent = sum(dataset_latents.values())
 
@@ -649,27 +751,29 @@ class AnemoiEnsModelEncProcDecUnionDecoderForecaster(AnemoiModelEncProcDecUnionD
             x_skip_dict[dataset_name] = x_skip
             shard_shapes_data_dict[dataset_name] = shard_shapes_data
 
-            encoder_edge_attr, encoder_edge_index, enc_edge_shard_shapes = self.encoder_graph_provider[
-                dataset_name
-            ].get_edges(
-                batch_size=batch_size,
-                model_comm_group=model_comm_group,
-            )
+            if dataset_name in self.encoder:
+                encoder_edge_attr, encoder_edge_index, enc_edge_shard_shapes = self.encoder_graph_provider[
+                    dataset_name
+                ].get_edges(
+                    batch_size=batch_size,
+                    model_comm_group=model_comm_group,
+                )
 
-            x_data_latent, x_latent = self.encoder[dataset_name](
-                (x_data_latent, x_hidden_latent),
-                batch_size=batch_size,
-                shard_shapes=(shard_shapes_data, shard_shapes_hidden_dict[dataset_name]),
-                edge_attr=encoder_edge_attr,
-                edge_index=encoder_edge_index,
-                model_comm_group=model_comm_group,
-                x_src_is_sharded=in_out_sharded[dataset_name],
-                x_dst_is_sharded=False,
-                keep_x_dst_sharded=True,
-                edge_shard_shapes=enc_edge_shard_shapes,
-            )
+                x_data_latent, x_latent = self.encoder[dataset_name](
+                    (x_data_latent, x_hidden_latent),
+                    batch_size=batch_size,
+                    shard_shapes=(shard_shapes_data, shard_shapes_hidden_dict[dataset_name]),
+                    edge_attr=encoder_edge_attr,
+                    edge_index=encoder_edge_index,
+                    model_comm_group=model_comm_group,
+                    x_src_is_sharded=in_out_sharded[dataset_name],
+                    x_dst_is_sharded=False,
+                    keep_x_dst_sharded=True,
+                    edge_shard_shapes=enc_edge_shard_shapes,
+                )
+                dataset_latents[dataset_name] = x_latent
+
             x_data_latent_dict[dataset_name] = x_data_latent
-            dataset_latents[dataset_name] = x_latent
 
         shard_shapes_hidden = shard_shapes_hidden_dict[dataset_names[0]]
         assert all(

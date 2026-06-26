@@ -14,6 +14,7 @@ from .kcrps import KernelCRPS
 from .kcrps import SampledNetatmoAlmostFairKernelCRPSOnRadarGridLoss
 from .kcrps import SampledGridPointAlmostFairKernelCRPS
 from .lightning import LightningActiveMaskLoss
+from .lightning import LightningHaloLoss
 from .lightning import LightningSpatialTemporalAggregatedAlmostFairKernelCRPSLoss
 from .lightning import LightningSpatialTemporalAggregatedHuberLoss
 from .lightning import LightningTemporalIncrementHuberLoss
@@ -47,6 +48,7 @@ __all__ = [
     "HuberLoss",
     "KernelCRPS",
     "LightningActiveMaskLoss",
+    "LightningHaloLoss",
     "LightningSpatialTemporalAggregatedAlmostFairKernelCRPSLoss",
     "LightningSpatialTemporalAggregatedHuberLoss",
     "LightningTemporalIncrementHuberLoss",

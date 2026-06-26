@@ -281,6 +281,7 @@ class ImplementedLossesUsingBaseLossSchema(str, Enum):
     logfft2d = "anemoi.training.losses.spectral.LogFFT2Distance"
     spectral_crps = "anemoi.training.losses.spectral.SpectralCRPSLoss"
     tail_weighted_rolling_huber = "anemoi.training.losses.TailWeightedRollingAccumulationHuberLoss"
+    lightning_halo = "anemoi.training.losses.LightningHaloLoss"
     multi_threshold_wet_area = "anemoi.training.losses.MultiThresholdWetAreaLoss"
     netatmo_wet_dry_on_radar_grid = "anemoi.training.losses.NetatmoWetDryOnRadarGridLoss"
     spectral_l2 = "anemoi.training.losses.spectral.SpectralL2Loss"
