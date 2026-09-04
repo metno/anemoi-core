@@ -38,6 +38,7 @@ dependencies = [
   "networkx>=3.1",
   "numpy>=1.26",
   "plotly>=5.19",
+  "pyproj>=3.6",
   "scikit-learn>=1.5",
   "scipy>=1.6",
   "torch>=2.2,<2.11",

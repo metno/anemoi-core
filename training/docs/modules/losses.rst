@@ -89,6 +89,42 @@ deterministic:
             _target_: anemoi.training.losses.CRPS
             # loss function kwargs here
 
+Projected Regular Grids
+=======================
+
+Cartesian spectral losses can select and order the largest complete
+regular rectangle described by a graph node attribute. Configure
+``RegularGridIndices`` on the data nodes using the grid's projected CRS,
+then reference that attribute from the loss:
+
+.. code:: yaml
+
+   # graph configuration
+   nodes:
+      data:
+         attributes:
+            fft_grid_indices:
+               _target_: anemoi.graphs.nodes.attributes.RegularGridIndices
+               proj4_string: "+proj=lcc +lat_1=63.3 +lat_2=63.3 +lat_0=63.3 +lon_0=15 +datum=WGS84 +units=m +no_defs"
+               mask_node_attr_name: cutout_mask
+               relative_tolerance: 1.0e-4
+               absolute_tolerance: 1.0
+
+   # training configuration
+   training_loss:
+      datasets:
+         data:
+            _target_: anemoi.training.losses.SpectralCRPSLoss
+            transform: fft2d
+            grid_indices_attribute: fft_grid_indices
+            scalers: []
+
+The graph attribute stores zero-based projected row and column indices
+for selected nodes and ``(-1, -1)`` elsewhere. The loss derives
+``x_dim`` and ``y_dim`` and gathers nodes in row-major order. This
+selection is independent of the model output mask and cannot be combined
+with ``subgrid``, ``projection_config``, or spherical harmonic transforms.
+
 .. _multiscale-loss-functions:
 
 ***************************

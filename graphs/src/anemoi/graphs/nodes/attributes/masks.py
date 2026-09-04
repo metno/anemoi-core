@@ -14,12 +14,88 @@ from abc import abstractmethod
 
 import numpy as np
 import torch
+from pyproj import CRS
+from pyproj import Transformer
 from torch_geometric.data.storage import NodeStorage
 
 from anemoi.datasets import open_dataset
+from anemoi.graphs.generate.regular_grid import find_largest_regular_grid
+from anemoi.graphs.nodes.attributes.base_attributes import BaseNodeAttribute
 from anemoi.graphs.nodes.attributes.base_attributes import BooleanBaseNodeAttribute
 
 LOGGER = logging.getLogger(__name__)
+
+
+class RegularGridIndices(BaseNodeAttribute):
+    """Projected regular-grid row and column indices for spectral transforms.
+
+    Selected nodes receive zero-based ``(row, column)`` indices. Nodes outside
+    the largest complete rectangle receive ``(-1, -1)``.
+    """
+
+    def __init__(
+        self,
+        proj4_string: str,
+        mask_node_attr_name: str | None = None,
+        x_spacing: float | None = None,
+        y_spacing: float | None = None,
+        relative_tolerance: float = 1.0e-4,
+        absolute_tolerance: float = 1.0e-6,
+        maximum_grid_cells: int = 100_000_000,
+    ) -> None:
+        super().__init__(norm=None, dtype="int64")
+        self.target_crs = CRS.from_user_input(proj4_string)
+        self.mask_node_attr_name = mask_node_attr_name
+        self.x_spacing = x_spacing
+        self.y_spacing = y_spacing
+        self.relative_tolerance = relative_tolerance
+        self.absolute_tolerance = absolute_tolerance
+        self.maximum_grid_cells = maximum_grid_cells
+
+    def get_raw_values(self, nodes: NodeStorage, **kwargs) -> torch.Tensor:
+        """Project node coordinates and encode the largest regular rectangle."""
+        coordinates = nodes.x.detach().cpu().numpy()
+        if coordinates.ndim != 2 or coordinates.shape[1] != 2:
+            raise ValueError(f"Node coordinates must have shape (N, 2), got {coordinates.shape}.")
+
+        num_nodes = len(coordinates)
+        candidate_indices = np.arange(num_nodes)
+        if self.mask_node_attr_name is not None:
+            if self.mask_node_attr_name not in nodes:
+                raise ValueError(f"Node storage has no mask attribute {self.mask_node_attr_name!r}.")
+            source_mask = nodes[self.mask_node_attr_name].detach().cpu().numpy().astype(bool).squeeze()
+            if source_mask.ndim != 1 or len(source_mask) != len(coordinates):
+                raise ValueError(
+                    f"Mask attribute {self.mask_node_attr_name!r} must have one value per node, "
+                    f"got shape {source_mask.shape}."
+                )
+            candidate_indices = candidate_indices[source_mask]
+            coordinates = coordinates[source_mask]
+
+        latitudes, longitudes = np.rad2deg(coordinates).T
+        transformer = Transformer.from_crs("EPSG:4326", self.target_crs, always_xy=True)
+        x, y = transformer.transform(longitudes, latitudes)
+        subset = find_largest_regular_grid(
+            np.column_stack((x, y)),
+            x_spacing=self.x_spacing,
+            y_spacing=self.y_spacing,
+            relative_tolerance=self.relative_tolerance,
+            absolute_tolerance=self.absolute_tolerance,
+            maximum_grid_cells=self.maximum_grid_cells,
+        )
+
+        indices = np.full((num_nodes, 2), -1, dtype=np.int64)
+        selected_indices = candidate_indices[subset.node_indices]
+        indices[selected_indices, 0] = subset.rows
+        indices[selected_indices, 1] = subset.columns
+        LOGGER.info(
+            "Largest complete regular grid in %s has shape (y=%d, x=%d) and %d points.",
+            self.target_crs.to_string(),
+            subset.shape[0],
+            subset.shape[1],
+            len(subset.node_indices),
+        )
+        return torch.from_numpy(indices)
 
 
 class BaseAnemoiDatasetVariable(BooleanBaseNodeAttribute):

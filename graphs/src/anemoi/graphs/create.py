@@ -9,6 +9,7 @@
 
 
 import logging
+import os
 from itertools import chain
 from pathlib import Path
 
@@ -139,7 +140,12 @@ class GraphCreator:
 
         if not save_path.exists() or overwrite:
             save_path.parent.mkdir(parents=True, exist_ok=True)
-            torch.save(graph, save_path)
+            temporary_path = save_path.with_name(f".{save_path.name}.{os.getpid()}.tmp")
+            try:
+                torch.save(graph, temporary_path)
+                temporary_path.replace(save_path)
+            finally:
+                temporary_path.unlink(missing_ok=True)
             LOGGER.info(f"Graph saved at {save_path}.")
         else:
             # The error is only logged for compatibility with multi-gpu training in anemoi-training.

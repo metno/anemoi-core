@@ -22,6 +22,7 @@ from .masks import GridsMask
 from .masks import LimitedAreaMask
 from .masks import NonmissingAnemoiDatasetVariable
 from .masks import NonzeroAnemoiDatasetVariable
+from .masks import RegularGridIndices
 
 __all__ = [
     "GridsMask",
@@ -33,6 +34,7 @@ __all__ = [
     "MaskedPlanarAreaWeights",
     "NonmissingAnemoiDatasetVariable",
     "NonzeroAnemoiDatasetVariable",
+    "RegularGridIndices",
     "BooleanAndMask",
     "BooleanNot",
     "BooleanOrMask",

@@ -73,6 +73,19 @@ class NonmissingAnemoiDatasetVariableSchema(BaseModel):
     "The anemoi-datasets variable to use."
 
 
+class RegularGridIndicesSchema(BaseModel):
+    """Projected regular-grid indices for Cartesian spectral transforms."""
+
+    target_: Literal["anemoi.graphs.nodes.attributes.RegularGridIndices"] = Field(..., alias="_target_")
+    proj4_string: str = Field(min_length=1)
+    mask_node_attr_name: str | None = None
+    x_spacing: float | None = Field(default=None, gt=0)
+    y_spacing: float | None = Field(default=None, gt=0)
+    relative_tolerance: float = Field(default=1.0e-4, ge=0)
+    absolute_tolerance: float = Field(default=1.0e-6, ge=0)
+    maximum_grid_cells: int = Field(default=100_000_000, gt=0)
+
+
 SingleAttributeSchema = (
     PlanarAreaWeightSchema
     | MaskedPlanarAreaWeightsSchema
@@ -80,6 +93,7 @@ SingleAttributeSchema = (
     | CutOutMaskSchema
     | GridsMaskSchema
     | NonmissingAnemoiDatasetVariableSchema
+    | RegularGridIndicesSchema
 )
 
 

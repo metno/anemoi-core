@@ -513,6 +513,8 @@ class SpectralLossSchema(BaseLossSchema):
     """Type of spectral transform to use."""
     subgrid: tuple[int, int | None] | str | None = None
     """Optional slice or string to select a subgrid before the transform."""
+    grid_indices_attribute: str | None = None
+    """Graph node attribute containing regular-grid row and column indices."""
     projection_config: SpectralProjectionConfigSchema | None = None
     """Optional sparse projection applied to the data before the spectral transform."""
 
@@ -524,6 +526,13 @@ class SpectralLossSchema(BaseLossSchema):
                 "spherical harmonic transforms require the full grid"
             )
             raise ValueError(msg)
+        if self.grid_indices_attribute is not None:
+            if self.subgrid is not None:
+                raise ValueError("grid_indices_attribute and subgrid are mutually exclusive")
+            if self.projection_config is not None:
+                raise ValueError("grid_indices_attribute and projection_config are mutually exclusive")
+            if self.transform in ("reduced_sht", "octahedral_sht"):
+                raise ValueError(f"grid_indices_attribute is not supported for the '{self.transform}' transform")
         return self
 
     class Config(BaseModel.Config):

@@ -1,0 +1,12 @@
+nodes:
+  data:
+    node_builder:
+      _target_: anemoi.graphs.nodes.AnemoiDatasetNodes
+      dataset: ${data.training.dataset}
+    attributes:
+      fft_grid_indices:
+        _target_: anemoi.graphs.nodes.attributes.RegularGridIndices
+        proj4_string: "+proj=lcc +lat_1=63.3 +lat_2=63.3 +lat_0=63.3 +lon_0=15 +datum=WGS84 +units=m +no_defs"
+        mask_node_attr_name: cutout_mask
+        relative_tolerance: 1.0e-4
+        absolute_tolerance: 1.0

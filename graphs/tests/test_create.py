@@ -54,3 +54,4 @@ class TestGraphCreator:
             graph_saved = torch.load(graph_path, weights_only=False)
             assert graph.node_types == graph_saved.node_types
             assert graph.edge_types == graph_saved.edge_types
+            assert not list(graph_path.parent.glob(f".{graph_path.name}.*.tmp"))

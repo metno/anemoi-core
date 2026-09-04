@@ -16,6 +16,7 @@ from anemoi.training.schemas.training import MultiscaleConfigDiskSchema
 from anemoi.training.schemas.training import MultiscaleConfigOnTheFlySchema
 from anemoi.training.schemas.training import MultiScaleLossSchema
 from anemoi.training.schemas.training import OptimizerSchema
+from anemoi.training.schemas.training import SpectralLossSchema
 from anemoi.training.schemas.training import TimeAggregateLossWrapperSchema
 
 _TIME_AGG_CFG = {
@@ -89,6 +90,38 @@ def test_optimizer_schema_allows_extra_keys() -> None:
     assert model_dump["lr"] == 0.001
     assert model_dump["weight_decay"] == 0.01
     assert model_dump["extra_key"] == "extra_value"
+
+
+def test_spectral_loss_schema_accepts_grid_indices_attribute() -> None:
+    schema = SpectralLossSchema(
+        _target_="anemoi.training.losses.SpectralCRPSLoss",
+        transform="fft2d",
+        grid_indices_attribute="fft_grid_indices",
+        scalers=[],
+    )
+
+    assert schema.grid_indices_attribute == "fft_grid_indices"
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        {"subgrid": (0, 4)},
+        {"projection_config": {"matrix_path": "projection.npz"}},
+        {"transform": "octahedral_sht"},
+    ],
+)
+def test_spectral_loss_schema_rejects_incompatible_grid_selection(extra: dict) -> None:
+    config = {
+        "_target_": "anemoi.training.losses.SpectralCRPSLoss",
+        "transform": "fft2d",
+        "grid_indices_attribute": "fft_grid_indices",
+        "scalers": [],
+        **extra,
+    }
+
+    with pytest.raises(ValidationError):
+        SpectralLossSchema(**config)
 
 
 _MULTISCALE_BASE = {

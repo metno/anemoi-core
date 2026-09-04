@@ -17,6 +17,7 @@ import pytest
 import torch
 from omegaconf import DictConfig
 from pytest_mock import MockerFixture
+from torch_geometric.data import HeteroData
 
 from anemoi.training.losses import CRPS
 from anemoi.training.losses import FourierCorrelationLoss
@@ -479,6 +480,91 @@ def test_fft2d_spectral_losses_shape_and_validation(target: str) -> None:
     wrong = (torch.ones((6, 1, 1, 710 * 640 + 1, 2)), torch.zeros((6, 1, 1, 710 * 640 + 1, 2)))
     with pytest.raises(einops.EinopsError):
         _ = loss(*wrong, squash=True)
+
+
+def test_spectral_loss_gathers_graph_grid_in_row_major_order() -> None:
+    ordered_source_indices = torch.tensor([2, 0, 5, 1, 7, 4])
+    graph_indices = torch.full((8, 2), -1, dtype=torch.long)
+    rows, columns = torch.meshgrid(torch.arange(2), torch.arange(3), indexing="ij")
+    graph_indices[ordered_source_indices] = torch.stack((rows.flatten(), columns.flatten()), dim=1)
+    graph = HeteroData()
+    graph["data"].x = torch.zeros(8, 2)
+    graph["data"].fft_grid_indices = graph_indices
+    pred = torch.randn(2, 1, 1, 8, 2)
+    target = torch.randn(2, 1, 1, 8, 2)
+
+    graph_loss = get_loss_function(
+        DictConfig(
+            {
+                "_target_": "anemoi.training.losses.LogSpectralDistance",
+                "transform": "fft2d",
+                "grid_indices_attribute": "fft_grid_indices",
+            }
+        ),
+        graph_data=graph,
+        data_node_name="data",
+    )
+    manual_loss = LogSpectralDistance(transform="fft2d", x_dim=3, y_dim=2)
+
+    actual = graph_loss(pred, target, squash=False)
+    expected = manual_loss(
+        pred.index_select(TensorDim.GRID, ordered_source_indices),
+        target.index_select(TensorDim.GRID, ordered_source_indices),
+        squash=False,
+    )
+
+    torch.testing.assert_close(actual, expected)
+    assert graph_loss.transform.x_dim == 3
+    assert graph_loss.transform.y_dim == 2
+
+
+@pytest.mark.parametrize(
+    "kwargs, match",
+    [
+        ({"subgrid": (0, 4)}, "mutually exclusive"),
+        ({"projection_config": {}}, "mutually exclusive"),
+        ({"transform": "octahedral_sht", "nlat": 2}, "not supported"),
+    ],
+)
+def test_spectral_grid_indices_reject_incompatible_options(kwargs: dict, match: str) -> None:
+    graph = HeteroData()
+    graph["data"].x = torch.zeros(4, 2)
+    graph["data"].fft_grid_indices = torch.tensor([[0, 0], [0, 1], [1, 0], [1, 1]])
+
+    with pytest.raises(ValueError, match=match):
+        LogSpectralDistance(
+            grid_indices_attribute="fft_grid_indices",
+            graph_data=graph,
+            data_node_name="data",
+            **kwargs,
+        )
+
+
+@pytest.mark.parametrize(
+    "grid_indices, kwargs, match",
+    [
+        (torch.tensor([[0, 0], [0, 1], [1, 0], [-1, -1]]), {}, "complete zero-based"),
+        (torch.tensor([[0, 0], [0, 1], [1, -1], [1, 1]]), {}, "non-negative"),
+        (torch.tensor([[0, 0], [0, 1], [1, 0], [1, 1]]), {"x_dim": 3}, "does not match"),
+    ],
+)
+def test_spectral_grid_indices_validate_graph_contract(
+    grid_indices: torch.Tensor,
+    kwargs: dict,
+    match: str,
+) -> None:
+    graph = HeteroData()
+    graph["data"].x = torch.zeros(4, 2)
+    graph["data"].fft_grid_indices = grid_indices
+
+    with pytest.raises(ValueError, match=match):
+        LogSpectralDistance(
+            transform="fft2d",
+            grid_indices_attribute="fft_grid_indices",
+            graph_data=graph,
+            data_node_name="data",
+            **kwargs,
+        )
 
 
 @pytest.mark.parametrize(

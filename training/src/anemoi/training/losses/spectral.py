@@ -101,6 +101,7 @@ class SpectralLoss(BaseLoss):
         ] = "fft2d",
         *,
         subgrid: tuple[int, int | None] | None = None,
+        grid_indices_attribute: str | None = None,
         projection_config: object | None = None,
         graph_data: HeteroData | None = None,
         data_node_name: str = DEFAULT_DATASET_NAME,
@@ -117,6 +118,9 @@ class SpectralLoss(BaseLoss):
         subgrid
             Optional ``(start, end)`` slice applied to the grid before the transform;
             ``end=None`` runs to the last gridpoint.
+        grid_indices_attribute
+            Optional graph node attribute containing ``(row, column)`` for nodes in
+            a complete regular grid and ``(-1, -1)`` for excluded nodes.
         projection_config
             Optional sparse-projection config applied after the slice and before the
             transform. See
@@ -155,6 +159,29 @@ class SpectralLoss(BaseLoss):
                 "spherical harmonic transforms require the full grid"
             )
             raise ValueError(msg)
+        if grid_indices_attribute is not None:
+            if subgrid is not None:
+                raise ValueError("grid_indices_attribute and subgrid are mutually exclusive")
+            if projection_config is not None:
+                raise ValueError("grid_indices_attribute and projection_config are mutually exclusive")
+            if transform not in ("fft2d", "dct2d"):
+                raise ValueError(f"grid_indices_attribute is not supported for the '{transform}' transform")
+            grid_gather_indices, y_dim, x_dim = self._grid_selection_from_graph(
+                graph_data,
+                data_node_name,
+                grid_indices_attribute,
+            )
+            for dimension_name, derived_dimension in (("x_dim", x_dim), ("y_dim", y_dim)):
+                configured_dimension = kwargs.get(dimension_name)
+                if configured_dimension is not None and configured_dimension != derived_dimension:
+                    raise ValueError(
+                        f"Configured {dimension_name}={configured_dimension} does not match "
+                        f"{grid_indices_attribute!r}, which defines {derived_dimension}."
+                    )
+                kwargs[dimension_name] = derived_dimension
+        else:
+            grid_gather_indices = None
+        self.register_buffer("grid_gather_indices", grid_gather_indices, persistent=False)
         self.subgrid = slice(*(subgrid or (0, None)))
         self.projection_provider = ProjectionGraphProvider.from_config(
             projection_config,
@@ -188,7 +215,65 @@ class SpectralLoss(BaseLoss):
     def needs_shard_layout_info(self) -> bool:
         return True
 
+    @staticmethod
+    def _grid_selection_from_graph(
+        graph_data: HeteroData | None,
+        data_node_name: str,
+        attribute_name: str,
+    ) -> tuple[torch.Tensor, int, int]:
+        """Validate a regular-grid node attribute and return row-major source indices."""
+        if graph_data is None:
+            raise ValueError("grid_indices_attribute requires graph_data")
+        if data_node_name not in graph_data.node_types:
+            raise ValueError(
+                f"Graph does not contain node type {data_node_name!r}; available node types: {graph_data.node_types}."
+            )
+        nodes = graph_data[data_node_name]
+        if attribute_name not in nodes:
+            raise ValueError(f"Graph node type {data_node_name!r} has no attribute {attribute_name!r}.")
+
+        grid_indices = nodes[attribute_name]
+        if not isinstance(grid_indices, torch.Tensor) or grid_indices.ndim != 2 or grid_indices.shape[1] != 2:
+            shape = getattr(grid_indices, "shape", None)
+            raise ValueError(f"Graph attribute {attribute_name!r} must be an integer tensor of shape (N, 2), got {shape}.")
+        if torch.is_floating_point(grid_indices) or torch.is_complex(grid_indices):
+            raise ValueError(f"Graph attribute {attribute_name!r} must use an integer dtype.")
+
+        excluded = (grid_indices == -1).all(dim=1)
+        selected = (grid_indices >= 0).all(dim=1)
+        if not bool((excluded | selected).all()):
+            raise ValueError(
+                f"Graph attribute {attribute_name!r} must contain non-negative (row, column) pairs or (-1, -1)."
+            )
+        if not bool(selected.any()):
+            raise ValueError(f"Graph attribute {attribute_name!r} does not select any nodes.")
+
+        selected_pairs = grid_indices[selected].to(dtype=torch.long)
+        y_dim = int(selected_pairs[:, 0].max().item()) + 1
+        x_dim = int(selected_pairs[:, 1].max().item()) + 1
+        if y_dim < 2 or x_dim < 2:
+            raise ValueError(f"Graph attribute {attribute_name!r} must define a grid of at least 2 by 2 points.")
+
+        linear_indices = selected_pairs[:, 0] * x_dim + selected_pairs[:, 1]
+        sorted_linear_indices, order = torch.sort(linear_indices)
+        expected = torch.arange(y_dim * x_dim, device=sorted_linear_indices.device)
+        if sorted_linear_indices.shape != expected.shape or not torch.equal(sorted_linear_indices, expected):
+            raise ValueError(
+                f"Graph attribute {attribute_name!r} must define every cell of one complete zero-based "
+                f"regular grid; inferred shape is (y={y_dim}, x={x_dim})."
+            )
+
+        source_indices = torch.nonzero(selected, as_tuple=False).squeeze(1)
+        return source_indices[order], y_dim, x_dim
+
     def _select_subgrid(self, x: torch.Tensor) -> torch.Tensor:
+        if self.grid_gather_indices is not None:
+            if int(self.grid_gather_indices.max()) >= x.shape[TensorDim.GRID]:
+                raise ValueError(
+                    "Spectral grid indices refer to nodes outside the input grid dimension: "
+                    f"maximum index {int(self.grid_gather_indices.max())}, grid size {x.shape[TensorDim.GRID]}."
+                )
+            return torch.index_select(x, TensorDim.GRID, self.grid_gather_indices)
         # Obtain a subgrid by slicing the grid dim as a view, avoiding an explicit index-tensor allocation.
         index = [slice(None)] * x.ndim
         index[TensorDim.GRID] = self.subgrid

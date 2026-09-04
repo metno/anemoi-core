@@ -9,10 +9,12 @@
 
 import pytest
 import torch
+from pyproj import Transformer
 from torch_geometric.data import HeteroData
 
 from anemoi.graphs.nodes.attributes import CutOutMask
 from anemoi.graphs.nodes.attributes import GridsMask
+from anemoi.graphs.nodes.attributes import RegularGridIndices
 from anemoi.graphs.nodes.attributes.masks import BaseCombineAnemoiDatasetsMask
 
 
@@ -44,6 +46,36 @@ def test_get_mask_from_grid_size():
 
     assert all(grids_mask1 == torch.tensor([1, 1, 1, 0, 0, 0, 0, 0, 1], dtype=torch.bool))
     assert all(grids_mask2 == torch.tensor([0, 1, 1, 0, 0, 0, 0, 0, 0], dtype=torch.bool))
+
+
+def test_regular_grid_indices_projects_and_preserves_source_order() -> None:
+    target_crs = "EPSG:3857"
+    inverse = Transformer.from_crs(target_crs, "EPSG:4326", always_xy=True)
+    y, x = np.indices((3, 4))
+    projected = np.column_stack((x.reshape(-1) * 2_000.0, y.reshape(-1) * 3_000.0))
+    longitudes, latitudes = inverse.transform(projected[:, 0], projected[:, 1])
+    order = np.random.default_rng(12).permutation(len(projected))
+    graph = HeteroData()
+    regular_coordinates = torch.tensor(
+        np.column_stack((latitudes[order], longitudes[order])),
+        dtype=torch.float64,
+    )
+    graph["data"].x = torch.deg2rad(torch.cat((regular_coordinates, torch.tensor([[0.0, 120.0]]))))
+    graph["data"].cutout_mask = torch.tensor([True] * 12 + [False])
+
+    indices = RegularGridIndices(
+        proj4_string=target_crs,
+        mask_node_attr_name="cutout_mask",
+        x_spacing=2_000.0,
+        y_spacing=3_000.0,
+        absolute_tolerance=1.0e-3,
+    ).compute(graph, "data")
+
+    assert indices.dtype == torch.int64
+    assert indices.shape == (13, 2)
+    assert torch.equal(indices[-1], torch.tensor([-1, -1]))
+    linear_indices = indices[:-1, 0] * 4 + indices[:-1, 1]
+    np.testing.assert_array_equal(order[torch.argsort(linear_indices).numpy()], np.arange(12))
 
 
 @pytest.mark.parametrize("mask_class", [CutOutMask, GridsMask])
