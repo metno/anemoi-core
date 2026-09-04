@@ -10,6 +10,8 @@
 
 import datetime
 import logging
+import os
+import time
 from abc import ABC
 from abc import abstractmethod
 from functools import cached_property
@@ -56,6 +58,32 @@ from anemoi.training.utils.seeding import get_base_seed
 from anemoi.utils.provenance import gather_provenance_info
 
 LOGGER = logging.getLogger(__name__)
+
+GRAPH_BUILD_TIMEOUT_SECONDS = 3600
+GRAPH_BUILD_POLL_INTERVAL_SECONDS = 1.0
+
+
+def _distributed_global_rank() -> int:
+    """Return the global rank before Lightning initializes process groups."""
+    return int(os.environ.get("RANK", os.environ.get("SLURM_PROCID", "0")))
+
+
+def _wait_for_graph(save_path: Path, timeout: float = GRAPH_BUILD_TIMEOUT_SECONDS) -> HeteroData:
+    """Wait for rank zero to atomically publish a readable graph."""
+    deadline = time.monotonic() + timeout
+    last_error: Exception | None = None
+    while time.monotonic() < deadline:
+        if save_path.exists():
+            try:
+                return load_graph_from_file(save_path)
+            except (EOFError, OSError, RuntimeError) as error:
+                last_error = error
+        time.sleep(GRAPH_BUILD_POLL_INTERVAL_SECONDS)
+
+    message = f"Timed out after {timeout:.0f}s waiting for rank zero to create graph: {save_path}"
+    if last_error is not None:
+        message += f". Last load error: {last_error}"
+    raise TimeoutError(message)
 
 PL_VERSION = version.parse(pl.__version__)
 
@@ -256,6 +284,13 @@ class AnemoiTrainer(ABC):
             fused = uses_fused_dataset_graph(graph_cfg, dataset_names)
             required = dataset_names if fused else [DEFAULT_DATASET_NAME]
             graph = load_graph_from_file(save_path)
+            validate_loaded_graph(graph, required)
+            return graph
+
+        if save_path is not None and _distributed_global_rank() != 0:
+            graph = _wait_for_graph(save_path)
+            fused = uses_fused_dataset_graph(graph, dataset_names)
+            required = dataset_names if fused else [DEFAULT_DATASET_NAME]
             validate_loaded_graph(graph, required)
             return graph
 
