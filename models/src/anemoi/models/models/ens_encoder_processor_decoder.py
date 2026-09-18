@@ -45,6 +45,14 @@ class AnemoiEnsModelEncProcDec(AnemoiModelEncProcDec):
         n_step_output: int,
     ) -> None:
         self.condition_on_residual = DotDict(model_config).model.condition_on_residual
+        # Condition the encoder on the previous prognostic state (the input of the pre-0.12 ensemble
+        # model, e.g. boiling-blizzard), appended after x | node attributes | fcstep.
+        self.condition_on_prognostic_residual = DotDict(model_config).model.get(
+            "condition_on_prognostic_residual", False
+        )
+        if self.condition_on_residual and self.condition_on_prognostic_residual:
+            msg = "condition_on_residual and condition_on_prognostic_residual are mutually exclusive."
+            raise ValueError(msg)
         super().__init__(
             model_config=model_config,
             data_indices=data_indices,
@@ -68,7 +76,7 @@ class AnemoiEnsModelEncProcDec(AnemoiModelEncProcDec):
     def _calculate_input_dim(self, dataset_name: str) -> int:
         base_input_dim = super()._calculate_input_dim(dataset_name)
         base_input_dim += 1  # for forecast step (fcstep)
-        if self.condition_on_residual:
+        if self.condition_on_residual or self.condition_on_prognostic_residual:
             base_input_dim += self.num_input_channels_prognostic[dataset_name]
         return base_input_dim
 
@@ -111,6 +119,18 @@ class AnemoiEnsModelEncProcDec(AnemoiModelEncProcDec):
                 (
                     x_data_latent,
                     einops.rearrange(x_skip_cond, "bse grid vars -> (bse grid) vars"),
+                ),
+                dim=-1,
+            )
+        elif self.condition_on_prognostic_residual:
+            # x_skip is (batch, [time,] ensemble, grid, vars) over all input variables; take the
+            # prognostic ones at the last input step, as the pre-0.12 ensemble model did.
+            x_skip_prog = x_skip[:, 0] if x_skip.ndim == 5 else x_skip
+            x_skip_prog = x_skip_prog[..., self._internal_input_idx[dataset_name]]
+            x_data_latent = torch.cat(
+                (
+                    x_data_latent,
+                    einops.rearrange(x_skip_prog, "batch ensemble grid vars -> (batch ensemble grid) vars"),
                 ),
                 dim=-1,
             )
