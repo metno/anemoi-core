@@ -8,6 +8,7 @@
 # nor does it submit to any jurisdiction.
 
 import logging
+import math
 from abc import ABC
 from abc import abstractmethod
 from typing import Optional
@@ -50,6 +51,7 @@ class BaseNoiseInjector(nn.Module, ABC):
         grid_shard_sizes: ShardSizes,
         noise_dtype: torch.dtype = torch.float32,
         model_comm_group: Optional[ProcessGroup] = None,
+        reset_noise: bool = False,
     ) -> tuple[Tensor, Optional[Tensor]]:
         """Forward pass for noise injection.
 
@@ -100,6 +102,7 @@ class NoOpNoiseInjector(BaseNoiseInjector):
         grid_shard_sizes: ShardSizes,
         noise_dtype: torch.dtype = torch.float32,
         model_comm_group: Optional[ProcessGroup] = None,
+        reset_noise: bool = False,
     ) -> tuple[Tensor, None]:
         """Pass through input unchanged with no noise."""
         return x, None
@@ -123,6 +126,8 @@ class NoiseConditioning(BaseNoiseInjector):
         sparse_projector_num_chunks: int = 1,
         num_channels: Optional[int] = None,
         graph_data: Optional[HeteroData] = None,
+        temporal_correlation: float = 0.0,
+        spatially_constant: bool = False,
     ) -> None:
         """Initialize NoiseConditioning."""
         super().__init__()
@@ -130,6 +135,13 @@ class NoiseConditioning(BaseNoiseInjector):
         assert noise_mlp_hidden_dim > 0, "Noise channels must be a positive integer"
 
         self.noise_std = noise_std
+        if not 0.0 <= temporal_correlation <= 1.0:
+            raise ValueError("temporal_correlation must be between 0 and 1.")
+        self.temporal_correlation = float(temporal_correlation)
+        if spatially_constant and (noise_matrix is not None or noise_edges_name is not None):
+            raise ValueError("spatially_constant noise cannot be combined with a noise projection matrix.")
+        self.spatially_constant = spatially_constant
+        self._previous_noise = None
 
         # Noise channels
         self.noise_channels = noise_channels_dim
@@ -173,6 +185,10 @@ class NoiseConditioning(BaseNoiseInjector):
 
         LOGGER.info("processor noise channels = %d", self.noise_channels)
 
+    def reset_noise_state(self) -> None:
+        """Reset noise carried between consecutive model calls."""
+        self._previous_noise = None
+
     def forward(
         self,
         x: Tensor,
@@ -182,12 +198,17 @@ class NoiseConditioning(BaseNoiseInjector):
         grid_shard_sizes: ShardSizes,
         noise_dtype: torch.dtype = torch.float32,
         model_comm_group: Optional[ProcessGroup] = None,
+        reset_noise: bool = False,
     ) -> tuple[Tensor, Tensor]:
 
         noise_shape = (
             batch_size,
             ensemble_size,
-            grid_size if self.noise_graph_provider is None else self.noise_graph_provider.projection_matrix.shape[1],
+            1
+            if self.spatially_constant
+            else grid_size
+            if self.noise_graph_provider is None
+            else self.noise_graph_provider.projection_matrix.shape[1],
             self.noise_channels,
         )
 
@@ -209,12 +230,31 @@ class NoiseConditioning(BaseNoiseInjector):
             noise = all_to_all_transpose(
                 noise, 0, grid_shard_sizes, -1, channel_shard_sizes, model_comm_group
             )  # sharded grid dim, full channels
-        else:
+        elif not self.spatially_constant:
             noise = einops.rearrange(noise, "batch ensemble grid vars -> (batch ensemble grid) vars")  # shape of x
             noise_shard_sizes = get_shard_sizes(noise, 0, model_comm_group)
             noise = shard_tensor(noise, 0, noise_shard_sizes, model_comm_group)  # sharded grid dim, full channels
 
+        previous_noise = None if reset_noise else self._previous_noise
+        if self.temporal_correlation > 0.0 and previous_noise is not None:
+            if (
+                previous_noise.shape != noise.shape
+                or previous_noise.dtype != noise.dtype
+                or previous_noise.device != noise.device
+            ):
+                raise RuntimeError("Noise shape, dtype or device changed within one forecast sequence.")
+            noise.mul_(math.sqrt(1.0 - self.temporal_correlation**2)).add_(
+                previous_noise,
+                alpha=self.temporal_correlation,
+            )
+        self._previous_noise = noise.detach()
+
         noise = checkpoint(self.noise_mlp, noise, use_reentrant=False)
+
+        if self.spatially_constant:
+            local_grid_size = x.shape[0] // (batch_size * ensemble_size)
+            noise = noise.expand(batch_size, ensemble_size, local_grid_size, self.noise_channels)
+            noise = einops.rearrange(noise, "batch ensemble grid vars -> (batch ensemble grid) vars")
 
         LOGGER.debug("Noise noise.shape = %s, noise.norm: %.9e", noise.shape, torch.linalg.norm(noise))
 
@@ -238,6 +278,9 @@ class NoiseInjector(BaseNoiseInjector):
         layer_kernels: DotDict,
         noise_matrix: Optional[str] = None,
         graph_data: Optional[HeteroData] = None,
+        temporal_correlation: float = 0.0,
+        spatially_constant: bool = False,
+        sparse_projector_num_chunks: int = 1,
     ) -> None:
         """Initialize NoiseInjector.
 
@@ -267,6 +310,9 @@ class NoiseInjector(BaseNoiseInjector):
             layer_kernels=layer_kernels,
             noise_matrix=noise_matrix,
             graph_data=graph_data,
+            temporal_correlation=temporal_correlation,
+            spatially_constant=spatially_constant,
+            sparse_projector_num_chunks=sparse_projector_num_chunks,
         )
         self.noise_channels = noise_channels_dim
         self.projection = nn.Linear(num_channels + self.noise_channels, num_channels)
@@ -280,6 +326,7 @@ class NoiseInjector(BaseNoiseInjector):
         grid_shard_sizes: ShardSizes,
         noise_dtype: torch.dtype = torch.float32,
         model_comm_group: Optional[ProcessGroup] = None,
+        reset_noise: bool = False,
     ) -> tuple[Tensor, None]:
         """Generate noise and inject it into the input tensor.
 
@@ -313,9 +360,14 @@ class NoiseInjector(BaseNoiseInjector):
             grid_shard_sizes=grid_shard_sizes,
             noise_dtype=noise_dtype,
             model_comm_group=model_comm_group,
+            reset_noise=reset_noise,
         )
 
         return (
             self.projection(torch.cat([x, noise], dim=-1)),
             None,
         )
+
+    def reset_noise_state(self) -> None:
+        """Reset noise carried between consecutive model calls."""
+        self._noise_conditioning.reset_noise_state()

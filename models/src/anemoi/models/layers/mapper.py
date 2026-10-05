@@ -88,7 +88,7 @@ class BaseMapper(nn.Module, ABC):
         pass
 
     @abstractmethod
-    def post_process(self, x_dst):
+    def post_process(self, x_dst, **kwargs):
         pass
 
     @abstractmethod
@@ -307,6 +307,8 @@ class GraphTransformerBaseMapper(BaseMapper, ABC):
         batch_size: int,
         model_comm_group: Optional[ProcessGroup] = None,
         cond: Optional[tuple[Tensor, Tensor]] = None,
+        output_cond: Optional[Tensor] = None,
+        output_cond_indices: Optional[Tensor] = None,
         **kwargs,
     ) -> Tensor:
         # O(1) slicing: extract subgraph for this chunk
@@ -330,7 +332,11 @@ class GraphTransformerBaseMapper(BaseMapper, ABC):
             **kwargs,
         )
 
-        return self.post_process(x_dst_out)
+        return self.post_process(
+            x_dst_out,
+            output_cond=output_cond,
+            output_cond_indices=output_cond_indices,
+        )
 
     def mapper_forward_with_edge_sharding(
         self,
@@ -342,6 +348,7 @@ class GraphTransformerBaseMapper(BaseMapper, ABC):
         model_comm_group: Optional[ProcessGroup] = None,
         keep_x_dst_sharded: bool = False,
         cond: Optional[tuple[Tensor, Tensor]] = None,
+        output_cond: Optional[Tensor] = None,
         edges_are_dst_sorted: bool = True,
         **kwargs,
     ) -> PairTensor:
@@ -361,9 +368,31 @@ class GraphTransformerBaseMapper(BaseMapper, ABC):
         out_channels = self.out_channels_dst if self.out_channels_dst is not None else self.hidden_dim
         out_type = torch.get_autocast_gpu_dtype() if torch.is_autocast_enabled() else x_dst.dtype
         out_dst = torch.empty((*x_dst.shape[:-1], out_channels), device=x_dst.device, dtype=out_type)
+        output_cond_grid_size = None
+        output_cond_offset = 0
+        if output_cond is not None:
+            total_dst_rows = sum(shard_info.dst_nodes) if shard_info.dst_is_sharded() else x_dst.shape[0]
+            if total_dst_rows % output_cond.shape[0] != 0:
+                raise ValueError(
+                    f"Decoder rows ({total_dst_rows}) must be divisible by condition rows ({output_cond.shape[0]})."
+                )
+            output_cond_grid_size = total_dst_rows // output_cond.shape[0]
+            if model_comm_group is not None:
+                output_cond_offset = sum(
+                    shard_info.dst_nodes[: torch.distributed.get_rank(model_comm_group)]
+                )
 
         for chunk_id in range(chunk_partition.num_parts):
             dst_range = chunk_partition._get_dst_range(chunk_id)
+            output_cond_indices = (
+                None
+                if output_cond_grid_size is None
+                else torch.div(
+                    torch.arange(dst_range.start, dst_range.stop, device=x_dst.device) + output_cond_offset,
+                    output_cond_grid_size,
+                    rounding_mode="floor",
+                )
+            )
             out_dst[dst_range] = maybe_checkpoint(
                 self.run_processor_chunk,
                 self.gradient_checkpointing,
@@ -376,6 +405,8 @@ class GraphTransformerBaseMapper(BaseMapper, ABC):
                 batch_size,
                 model_comm_group,
                 cond,
+                output_cond,
+                output_cond_indices,
                 edges_are_dst_sorted=True,  # ensured by prepare_edge_sharding_wrapper
                 **kwargs,
             ).to(dtype=out_type)
@@ -394,6 +425,7 @@ class GraphTransformerBaseMapper(BaseMapper, ABC):
         edge_index: Adj,
         model_comm_group: Optional[ProcessGroup] = None,
         keep_x_dst_sharded: bool = False,
+        output_cond: Optional[Tensor] = None,
         edges_are_dst_sorted: bool = True,
         **kwargs,
     ) -> PairTensor:
@@ -435,7 +467,29 @@ class GraphTransformerBaseMapper(BaseMapper, ABC):
             **kwargs,
         )
 
-        x_dst = self.post_process(x_dst)
+        output_cond_indices = None
+        if output_cond is not None:
+            total_dst_rows = sum(shard_info.dst_nodes) if shard_info.dst_is_sharded() else x_dst.shape[0]
+            if total_dst_rows % output_cond.shape[0] != 0:
+                raise ValueError(
+                    f"Decoder rows ({total_dst_rows}) must be divisible by condition rows ({output_cond.shape[0]})."
+                )
+            output_cond_offset = 0
+            if model_comm_group is not None:
+                output_cond_offset = sum(
+                    shard_info.dst_nodes[: torch.distributed.get_rank(model_comm_group)]
+                )
+            output_cond_indices = torch.div(
+                torch.arange(x_dst.shape[0], device=x_dst.device) + output_cond_offset,
+                total_dst_rows // output_cond.shape[0],
+                rounding_mode="floor",
+            )
+
+        x_dst = self.post_process(
+            x_dst,
+            output_cond=output_cond,
+            output_cond_indices=output_cond_indices,
+        )
 
         if not keep_x_dst_sharded:  # gather after processing
             x_dst = gather_tensor(x_dst, 0, shard_info.dst_nodes, model_comm_group)
@@ -709,8 +763,19 @@ class GraphTransformerBackwardMapper(GraphTransformerBaseMapper):
         x_dst = self.emb_nodes_dst(x_dst)
         return x_src, x_dst
 
-    def post_process(self, x_dst):
-        return self.node_data_extractor(x_dst)
+    def post_process(self, x_dst, output_cond=None, output_cond_indices=None):
+        x_dst = self.node_data_extractor[0](x_dst)
+        output = self.node_data_extractor[1](x_dst)
+        if getattr(self, "absolute_lead_noise_conditioner", None) is not None:
+            if output_cond is None:
+                raise ValueError("The absolute-lead noise conditioner requires `output_cond`.")
+            output = output + self.absolute_lead_noise_conditioner(
+                x_dst,
+                self.node_data_extractor[1],
+                output_cond,
+                output_cond_indices,
+            )
+        return output
 
 
 class GNNBaseMapper(BaseMapper, ABC):

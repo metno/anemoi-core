@@ -57,6 +57,20 @@ class BaseResidualConnection(nn.Module, ABC):
         return x.unsqueeze(1).expand(-1, n_step_output, -1, -1, -1)
 
 
+class ZeroConnection(BaseResidualConnection):
+    """Residual connection returning zeros with the requested output length."""
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        grid_shard_sizes=None,
+        model_comm_group=None,
+        n_step_output: int | None = None,
+    ) -> torch.Tensor:
+        x_skip = torch.zeros_like(x[:, -1, ...])
+        return self._expand_time(x_skip, n_step_output)
+
+
 class SkipConnection(BaseResidualConnection):
     """Skip connection module
 

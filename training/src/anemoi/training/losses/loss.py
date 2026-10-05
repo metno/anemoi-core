@@ -192,6 +192,7 @@ def get_loss_function(
     predicted_variables = loss_config.pop("predicted_variables", None)
     target_variables = loss_config.pop("target_variables", None)
     compatibility_options = loss_config.pop("check_variables_compatibility", {})
+    validation_postprocess = loss_config.pop("validation_postprocess", True)
 
     target = loss_config.get("_target_")
 
@@ -268,6 +269,7 @@ def get_loss_function(
         )
         loss_function.compatibility_options = dict(compatibility_options)
     _apply_scalers(loss_function, scalers_to_include, scalers, data_indices)
+    loss_function.validation_postprocess = bool(validation_postprocess)
     return loss_function
 
 

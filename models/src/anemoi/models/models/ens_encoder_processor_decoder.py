@@ -9,6 +9,7 @@
 
 
 import logging
+from collections.abc import Mapping
 from typing import Optional
 
 import einops
@@ -25,6 +26,8 @@ from anemoi.models.distributed.shapes import DatasetShardSizes
 from anemoi.models.distributed.shapes import GraphShardInfo
 from anemoi.models.distributed.shapes import ShardSizes
 from anemoi.models.distributed.shapes import get_shard_sizes
+from anemoi.models.layers.decoder_conditioning import AbsoluteLeadNoiseProcess
+from anemoi.models.layers.decoder_conditioning import DecoderAbsoluteLeadNoiseConditioner
 from anemoi.models.models import AnemoiModelEncProcDec
 from anemoi.utils.config import DotDict
 
@@ -41,10 +44,11 @@ class AnemoiEnsModelEncProcDec(AnemoiModelEncProcDec):
         data_indices: dict,
         statistics: dict,
         graph_data: HeteroData,
-        n_step_input: int,
-        n_step_output: int,
+        n_step_input: int | Mapping[str, int],
+        n_step_output: int | Mapping[str, int],
     ) -> None:
-        self.condition_on_residual = DotDict(model_config).condition_on_residual
+        model_config = DotDict(model_config)
+        self.condition_on_residual = model_config.condition_on_residual
         super().__init__(
             model_config=model_config,
             data_indices=data_indices,
@@ -53,16 +57,81 @@ class AnemoiEnsModelEncProcDec(AnemoiModelEncProcDec):
             n_step_input=n_step_input,
             n_step_output=n_step_output,
         )
+        output_residual_config = DotDict(model_config.get("output_residual", {}) or {})
+        self.output_residual = torch.nn.ModuleDict(
+            {
+                str(dataset_name): instantiate(residual_config, graph=self._graph_data)
+                for dataset_name, residual_config in output_residual_config.items()
+            }
+        )
 
     def _build_networks(self, model_config: DotDict) -> None:
         super()._build_networks(model_config)
 
+        encoder_adapter_datasets = tuple(
+            str(name) for name in model_config.get("zero_initialised_encoder_adapters", ())
+        )
+        unknown_adapter_datasets = sorted(set(encoder_adapter_datasets).difference(self.input_datasets))
+        if unknown_adapter_datasets:
+            raise ValueError(
+                "zero_initialised_encoder_adapters contains datasets without an encoder: "
+                f"{unknown_adapter_datasets}."
+            )
+        self.encoder_adapter = torch.nn.ModuleDict(
+            {
+                dataset_name: torch.nn.Linear(
+                    self.encoder[self.dataset2encoder[dataset_name]].hidden_dim,
+                    self.encoder[self.dataset2encoder[dataset_name]].hidden_dim,
+                    bias=False,
+                )
+                for dataset_name in encoder_adapter_datasets
+            }
+        )
+        for adapter in self.encoder_adapter.values():
+            torch.nn.init.zeros_(adapter.weight)
+
         self.noise_injector = instantiate(
             model_config.noise_injector,
             _recursive_=False,
+            num_channels=self.latent_aggregator.hidden_dim,
             graph_data=self._graph_data,
             sparse_projector_num_chunks=model_config.get("sparse_projector", {}).get("num_chunks", 1),
         )
+
+        conditioning_config = DotDict(model_config.get("absolute_lead_noise_output_conditioning", {}) or {})
+        conditioning_datasets = tuple(str(name) for name in conditioning_config.get("datasets", ()))
+        unknown_conditioning_datasets = sorted(set(conditioning_datasets).difference(self.target_datasets))
+        if unknown_conditioning_datasets:
+            raise ValueError(
+                "absolute_lead_noise_output_conditioning contains datasets without a decoder: "
+                f"{unknown_conditioning_datasets}."
+            )
+        self.absolute_lead_noise_process = torch.nn.ModuleDict()
+        for dataset_name in conditioning_datasets:
+            decoder_name = self.dataset2decoder[dataset_name]
+            decoder = self.decoder[decoder_name]
+            output_steps = self._get_n_step_output(dataset_name)
+            if decoder.out_channels_dst % output_steps != 0:
+                raise ValueError(
+                    f"Decoder '{decoder_name}' output dimension {decoder.out_channels_dst} is not divisible by "
+                    f"the {output_steps} output steps for '{dataset_name}'."
+                )
+            decoder.absolute_lead_noise_conditioner = DecoderAbsoluteLeadNoiseConditioner(
+                x_dim=decoder.hidden_dim,
+                output_steps=output_steps,
+                cond_dim=6 + int(conditioning_config.get("noise_channels", 4)),
+                hidden=int(conditioning_config.get("hidden", 128)),
+                zero_mean_across_output_steps=bool(
+                    conditioning_config.get("zero_mean_across_output_steps", False)
+                ),
+            )
+            self.absolute_lead_noise_process[dataset_name] = AbsoluteLeadNoiseProcess(
+                noise_channels=int(conditioning_config.get("noise_channels", 4)),
+                noise_std=float(conditioning_config.get("noise_std", 0.2)),
+                temporal_correlation=float(conditioning_config.get("temporal_correlation", 0.95)),
+                temporal_correlation_steps=float(conditioning_config.get("temporal_correlation_steps", 6.0)),
+                lead_time_scale_steps=float(conditioning_config.get("lead_time_scale_steps", 24.0)),
+            )
 
     def _calculate_input_dim(self, dataset_name: str) -> int:
         base_input_dim = super()._calculate_input_dim(dataset_name)
@@ -88,7 +157,7 @@ class AnemoiEnsModelEncProcDec(AnemoiModelEncProcDec):
             x,
             grid_shard_sizes=grid_shard_sizes,
             model_comm_group=model_comm_group,
-            n_step_output=self.n_step_output,
+            n_step_output=self._get_n_step_output(dataset_name),
         )
 
         if grid_shard_sizes is not None:
@@ -104,12 +173,16 @@ class AnemoiEnsModelEncProcDec(AnemoiModelEncProcDec):
             dim=-1,  # feature dimension
         )
 
-        if self.condition_on_residual:
+        if self.condition_on_residual and self.num_input_channels_prognostic[dataset_name] > 0:
             x_skip_cond = x_skip[:, 0] if x_skip.ndim == 5 else x_skip
+            prognostic_idx = self._internal_input_idx[dataset_name]
             x_data_latent = torch.cat(
                 (
                     x_data_latent,
-                    einops.rearrange(x_skip_cond, "bse grid vars -> (bse grid) vars"),
+                    einops.rearrange(
+                        x_skip_cond[..., prognostic_idx],
+                        "batch ensemble grid vars -> (batch ensemble grid) vars",
+                    ),
                 ),
                 dim=-1,
             )
@@ -124,6 +197,7 @@ class AnemoiEnsModelEncProcDec(AnemoiModelEncProcDec):
         batch_ens_size: int,
         dtype: torch.dtype,
         dataset_name: str | None = None,
+        x_output_skip: torch.Tensor | None = None,
     ):
         ensemble_size = batch_ens_size // batch_size
         x_out = (
@@ -132,7 +206,7 @@ class AnemoiEnsModelEncProcDec(AnemoiModelEncProcDec):
                 "(bs e n) (time vars) -> bs time e n vars",
                 bs=batch_size,
                 e=ensemble_size,
-                time=self.n_step_output,
+                time=self._get_n_step_output(dataset_name),
             )
             .to(dtype=dtype)
             .clone()
@@ -146,6 +220,10 @@ class AnemoiEnsModelEncProcDec(AnemoiModelEncProcDec):
                 x_skip.shape[1] == x_out.shape[1]
             ), f"Residual time dimension ({x_skip.shape[1]}) must match output time dimension ({x_out.shape[1]})."
             x_out[..., self._internal_output_idx[dataset_name]] += x_skip[..., self._internal_input_idx[dataset_name]]
+        if x_output_skip is not None:
+            x_out[..., self._internal_output_idx[dataset_name]] += x_output_skip[
+                ..., self._internal_input_idx[dataset_name]
+            ]
 
         for bounding in self.boundings[dataset_name]:
             # bounding performed in the order specified in the config file
@@ -182,6 +260,7 @@ class AnemoiEnsModelEncProcDec(AnemoiModelEncProcDec):
         dict[str, Tensor]
             Output tensor per dataset
         """
+        reset_noise = kwargs.pop("reset_noise", None)
         dataset_names = list(x.keys())
 
         # Extract and validate batch & ensemble sizes across datasets
@@ -196,10 +275,14 @@ class AnemoiEnsModelEncProcDec(AnemoiModelEncProcDec):
         for dataset_name in dataset_names:
             self._assert_valid_sharding(batch_size, ensemble_size, in_out_sharded[dataset_name], model_comm_group)
 
-        fcstep = min(1, fcstep)
+        forecast_block_index = float(fcstep)
+        if reset_noise is None:
+            reset_noise = forecast_block_index == 0.0
+        fcstep = float(min(1, int(fcstep)))
         # Process each dataset through its corresponding encoder
         dataset_latents = {}
         x_skip_dict = {}
+        x_output_skip_dict = {}
         x_data_latent_dict = {}
         shard_sizes_data_dict = {}
 
@@ -209,6 +292,16 @@ class AnemoiEnsModelEncProcDec(AnemoiModelEncProcDec):
         for dataset_name in x.keys():
             if dataset_name not in self.input_datasets:
                 continue
+
+            if dataset_name in self.output_residual:
+                x_output_skip_dict[dataset_name] = self.output_residual[dataset_name](
+                    x[dataset_name],
+                    grid_shard_sizes=(
+                        grid_shard_sizes[dataset_name] if grid_shard_sizes is not None else None
+                    ),
+                    model_comm_group=model_comm_group,
+                    n_step_output=self._get_n_step_output(dataset_name),
+                )
 
             x_data_latent, x_skip, shard_sizes_data = self._assemble_input(
                 x[dataset_name],
@@ -248,6 +341,8 @@ class AnemoiEnsModelEncProcDec(AnemoiModelEncProcDec):
                 keep_x_dst_sharded=True,  # always keep x_latent sharded for the processor
             )
             x_data_latent_dict[dataset_name] = x_data_latent
+            if dataset_name in self.encoder_adapter:
+                x_latent = self.encoder_adapter[dataset_name](x_latent)
             dataset_latents[dataset_name] = x_latent
 
         # Combine all dataset latents
@@ -259,7 +354,9 @@ class AnemoiEnsModelEncProcDec(AnemoiModelEncProcDec):
             ensemble_size=ensemble_size,
             grid_size=self.node_attributes.num_nodes[self._graph_name_hidden],
             grid_shard_sizes=shard_sizes_hidden,
+            noise_dtype=x_latent.dtype,
             model_comm_group=model_comm_group,
+            reset_noise=reset_noise,
         )
 
         (
@@ -291,7 +388,7 @@ class AnemoiEnsModelEncProcDec(AnemoiModelEncProcDec):
             x_target_latent, shard_sizes_target = self._assemble_targets(
                 x[dataset_name],
                 x_data_latent_dict.get(dataset_name, None),
-                batch_size,
+                batch_ens_size,
                 grid_shard_sizes,
                 model_comm_group,
                 dataset_name,
@@ -314,6 +411,22 @@ class AnemoiEnsModelEncProcDec(AnemoiModelEncProcDec):
             )
 
             decoder_name = self.dataset2decoder[dataset_name]
+            decoder_kwargs = {}
+            if dataset_name in self.absolute_lead_noise_process:
+                lead_steps = forecast_block_index * self._get_n_step_output(dataset_name) + torch.arange(
+                    1,
+                    self._get_n_step_output(dataset_name) + 1,
+                    device=x_latent_proc.device,
+                )
+                decoder_kwargs["output_cond"] = self.absolute_lead_noise_process[dataset_name](
+                    lead_steps=lead_steps,
+                    batch_size=batch_size,
+                    ensemble_size=ensemble_size,
+                    dtype=x_latent_proc.dtype,
+                    device=x_latent_proc.device,
+                    model_comm_group=model_comm_group,
+                    reset_state=bool(reset_noise),
+                )
             x_out = self.decoder[decoder_name](
                 (x_latent_proc, x_target_latent),
                 batch_size=batch_ens_size,
@@ -322,6 +435,7 @@ class AnemoiEnsModelEncProcDec(AnemoiModelEncProcDec):
                 edge_index=decoder_edge_index,
                 model_comm_group=model_comm_group,
                 keep_x_dst_sharded=in_out_sharded[dataset_name],  # keep x_out sharded iff in_out_sharded
+                **decoder_kwargs,
             )
 
             x_out_dict[dataset_name] = self._assemble_output(
@@ -331,6 +445,7 @@ class AnemoiEnsModelEncProcDec(AnemoiModelEncProcDec):
                 batch_ens_size,
                 dtype=x[dataset_name].dtype,
                 dataset_name=dataset_name,
+                x_output_skip=x_output_skip_dict.get(dataset_name, None),
             )
 
         return x_out_dict

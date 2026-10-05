@@ -215,7 +215,7 @@ class SchemaCommonMixin:
 
     def model_post_init(self, _: Any) -> None:
         expand_paths(self.system)
-        if self.diagnostics.log.mlflow.enabled and (
+        if self.diagnostics.log.mlflow is not None and self.diagnostics.log.mlflow.enabled and (
             self.system.output.logs.mlflow != self.diagnostics.log.mlflow.save_dir
         ):
             LOGGER.info("adjusting save_dir path to match output mlflow logs")

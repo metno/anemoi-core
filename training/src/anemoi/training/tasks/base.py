@@ -16,6 +16,8 @@ import torch
 
 from anemoi.models.data_indices.collection import IndexCollection
 from anemoi.training.utils.time_indices import normalize_time_indices
+from anemoi.utils.dates import frequency_to_timedelta
+from anemoi.utils.dates import frequency_to_string
 
 LOGGER = logging.getLogger(__name__)
 
@@ -53,6 +55,53 @@ class BaseTask(ABC):
         self._input_offsets = sorted(input_offsets)
         self._output_offsets = sorted(output_offsets)
         self._offsets = sorted(set(self._input_offsets + self._output_offsets))
+        self.dataset_input_offsets = {}
+        self.dataset_target_offsets = {}
+        self._dataset_names = []
+
+    def set_dataset_offsets(self, datasets: dict) -> None:
+        """Set explicit per-dataset histories, relative to forecast initialisation."""
+        self._dataset_names = list(datasets)
+        for name, config in datasets.items():
+            if config.get("input_offsets") is None:
+                continue
+            if config.get("target_offsets") is None:
+                raise ValueError(f"Dataset {name!r} requires both input_offsets and target_offsets")
+            inputs = [frequency_to_timedelta(offset) for offset in config["input_offsets"]]
+            targets = [frequency_to_timedelta(offset) for offset in config["target_offsets"]]
+            if inputs != sorted(set(inputs)) or targets != sorted(set(targets)):
+                raise ValueError(f"Dataset {name!r} offsets must be sorted and unique")
+            if not inputs or max(inputs) > datetime.timedelta(0):
+                raise ValueError(f"Dataset {name!r} needs a nonempty history ending no later than initialisation")
+            if targets and min(targets) <= datetime.timedelta(0):
+                raise ValueError(f"Dataset {name!r} targets must follow initialisation")
+            self.dataset_input_offsets[name] = inputs
+            self.dataset_target_offsets[name] = targets
+
+    @property
+    def num_input_timesteps_by_dataset(self) -> dict[str, int]:
+        if not self.dataset_input_offsets:
+            return {}
+        return {
+            name: len(self.dataset_input_offsets.get(name, self.get_input_offsets()))
+            for name in self._dataset_names
+        }
+
+    @property
+    def num_output_timesteps_by_dataset(self) -> dict[str, int]:
+        if not self.dataset_input_offsets:
+            return {}
+        output_offsets = set(self.get_output_offsets())
+        return {
+            name: sum(offset in output_offsets for offset in self.dataset_target_offsets.get(name, output_offsets))
+            for name in self._dataset_names
+        }
+
+    def get_dataset_offsets(self, dataset_name: str, **kwargs) -> list[datetime.timedelta]:
+        """Return the loaded times for one dataset, including auxiliary loss targets."""
+        if dataset_name not in self.dataset_input_offsets:
+            return self.get_offsets(**kwargs)
+        return sorted(set(self.dataset_input_offsets[dataset_name] + self.dataset_target_offsets[dataset_name]))
 
     def steps(self, mode: str = "training") -> Iterable[dict]:  # noqa: ARG002
         """Get the steps for the task."""
@@ -162,6 +211,10 @@ class BaseTask(ABC):
 
         x = {}
         for dataset_name, dataset_batch in batch.items():
+            time_indices = normalize_time_indices(self.get_batch_input_indices())
+            if dataset_name in self.dataset_input_offsets:
+                offsets = self.get_dataset_offsets(dataset_name)
+                time_indices = [offsets.index(offset) for offset in self.dataset_input_offsets[dataset_name]]
             dataset_batch = dataset_batch[:, time_indices]
             x[dataset_name] = dataset_batch[..., data_indices[dataset_name].data.input.full]
             LOGGER.debug("SHAPE: x[%s].shape = %s", dataset_name, list(x[dataset_name].shape))
@@ -186,11 +239,21 @@ class BaseTask(ABC):
             variable space (all variables including forcings).
         """
         time_indices = self.get_batch_output_indices(**kwargs)
-        self._assert_time_indices_in_batch(time_indices, batch, **kwargs)
+        if not self.dataset_input_offsets:
+            self._assert_time_indices_in_batch(time_indices, batch, **kwargs)
         time_indices = normalize_time_indices(time_indices)
 
         y = {}
         for dataset_name, dataset_batch in batch.items():
+            time_indices = normalize_time_indices(self.get_batch_output_indices(**kwargs))
+            if dataset_name in self.dataset_input_offsets:
+                offsets = self.get_dataset_offsets(dataset_name)
+                output_offsets = set(self.get_output_offsets(**kwargs))
+                time_indices = [
+                    offsets.index(offset)
+                    for offset in self.dataset_target_offsets[dataset_name]
+                    if offset in output_offsets
+                ]
             y[dataset_name] = dataset_batch[:, time_indices]
             LOGGER.debug("SHAPE: y[%s].shape = %s", dataset_name, list(y[dataset_name].shape))
         return y
@@ -234,7 +297,25 @@ class BaseTask(ABC):
 
         dataset_names = md_dict["metadata_inference"]["dataset_names"]
         for dataset_name in dataset_names:
-            md_dict["metadata_inference"][dataset_name]["timesteps"] = timesteps
+            dataset_timesteps = dict(timesteps)
+            if dataset_name in self.dataset_input_offsets:
+                offsets = self.get_dataset_offsets(dataset_name)
+                output_offsets = [
+                    offset for offset in self.get_output_offsets()
+                    if offset in self.dataset_target_offsets[dataset_name]
+                ]
+                input_indices = [offsets.index(offset) for offset in self.dataset_input_offsets[dataset_name]]
+                output_indices = [offsets.index(offset) for offset in output_offsets]
+                dataset_timesteps.update(
+                    input_offsets=[frequency_to_string(offset) for offset in self.dataset_input_offsets[dataset_name]],
+                    target_offsets=[frequency_to_string(offset) for offset in self.dataset_target_offsets[dataset_name]],
+                    relative_date_indices_training=sorted(input_indices + output_indices),
+                    input_relative_date_indices=input_indices,
+                    output_relative_date_indices=output_indices,
+                    num_input_timesteps=len(self.dataset_input_offsets[dataset_name]),
+                    num_output_timesteps=len(output_offsets),
+                )
+            md_dict["metadata_inference"][dataset_name]["timesteps"] = dataset_timesteps
 
 
 class BaseSingleStepTask(BaseTask):

@@ -60,6 +60,8 @@ class OffsetForecasterSchema(BaseModel):
     "Time shift applied to the offsets between rollout steps. 'default' infers the largest valid shift."
     rollout: RolloutSchema = Field(...)
     "Rollout configuration for autoregressive training."
+    fixed_input_window_datasets: list[str] = Field(default_factory=list)
+    "Datasets whose initial history is reused throughout rollout."
     validation_rollout: PositiveInt | None = Field(default=None, example=[None, 6, 12])
     "Minimum number of rollout steps unrolled in validation; the training rollout is always unrolled. "
     "The val loss is averaged over the training rollout only."

@@ -201,8 +201,8 @@ class BaseTrainingModule(pl.LightningModule, ABC):
         for dataset_name, mask in self.output_mask.items():
             combined_supporting_arrays[dataset_name].update(mask.supporting_arrays)
 
-        self.n_step_input = self.task.num_input_timesteps
-        self.n_step_output = self.task.num_output_timesteps
+        self.n_step_input = self.task.num_input_timesteps_by_dataset or self.task.num_input_timesteps
+        self.n_step_output = self.task.num_output_timesteps_by_dataset or self.task.num_output_timesteps
 
         self.model = AnemoiModelInterface(
             statistics=statistics,
@@ -352,7 +352,7 @@ class BaseTrainingModule(pl.LightningModule, ABC):
         # set flag if loss and metrics support sharding
         self._check_sharding_support()
 
-        LOGGER.debug("n_step_input: %d", self.n_step_input)
+        LOGGER.debug("n_step_input: %s", self.n_step_input)
 
         # lazy init model and reader group info, will be set by the DDPGroupStrategy:
         self.model_comm_group_id = 0
@@ -1169,7 +1169,12 @@ class BaseTrainingModule(pl.LightningModule, ABC):
                         grid_shard_sizes=self.grid_shard_sizes[dataset_name] if grid_shard_slice is not None else None,
                     )
 
-                metric_value = metric(y_pred_postprocessed, y_postprocessed, **metric_kwargs)
+                metric_postprocess = getattr(metric, "validation_postprocess", True)
+                metric_value = metric(
+                    y_pred_postprocessed if metric_postprocess else y_pred,
+                    y_postprocessed if metric_postprocess else y,
+                    **metric_kwargs,
+                )
                 # Detach and clone the metric value to avoid in-place modifications affecting the original tensor
                 # This was impacting cuda graphs
                 # TODO(cathal): double check now that everything compiles

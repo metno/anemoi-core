@@ -259,7 +259,7 @@ class NoiseConditioningSchema(BaseModel):
 
     target_: Literal["anemoi.models.layers.ensemble.NoiseConditioning"] = Field(..., alias="_target_")
     "Noise conditioning layer class"
-    noise_std: NonNegativeInt = Field(example=1)
+    noise_std: NonNegativeFloat = Field(example=1)
     "Standard deviation of the noise to be injected."
     noise_channels_dim: NonNegativeInt = Field(example=4)
     "Number of channels in the noise tensor."
@@ -277,6 +277,10 @@ class NoiseConditioningSchema(BaseModel):
     "Whether to row-normalize the noise projection matrix weights."
     autocast: bool = Field(default=False)
     "Whether to use autocast for the noise projection matrix operations."
+    temporal_correlation: float = Field(default=0.0, ge=0.0, le=1.0)
+    "Correlation of noise carried between forecast calls."
+    spatially_constant: bool = Field(default=False)
+    "Draw one noise vector per member and broadcast it across the hidden grid."
 
 
 class NoiseInjectorSchema(BaseModel):
@@ -284,7 +288,7 @@ class NoiseInjectorSchema(BaseModel):
 
     target_: Literal["anemoi.models.layers.ensemble.NoiseInjector"] = Field(..., alias="_target_")
     "Noise injector layer class"
-    noise_std: NonNegativeInt = Field(example=1)
+    noise_std: NonNegativeFloat = Field(example=1)
     "Standard deviation of the noise to be injected."
     noise_channels_dim: NonNegativeInt = Field(example=4)
     "Number of channels in the noise tensor."
@@ -292,6 +296,10 @@ class NoiseInjectorSchema(BaseModel):
     "Hidden dimension of the MLP used to process the noise."
     layer_kernels: Union[dict[str, dict], None] = Field(default_factory=dict)
     "Settings related to custom kernels for encoder processor and decoder blocks"
+    temporal_correlation: float = Field(default=0.0, ge=0.0, le=1.0)
+    "Correlation of noise carried between forecast calls."
+    spatially_constant: bool = Field(default=False)
+    "Draw one noise vector per member and broadcast it across the hidden grid."
 
 
 NoiseInjectorUnion = Annotated[
@@ -305,6 +313,12 @@ class EnsModelSchema(BaseModelSchema):
     "Noise injection configuration. Use NoOpNoiseInjector to disable, NoiseConditioning for conditioning, or NoiseInjector for direct injection."
     condition_on_residual: bool = Field(default=False)
     "Whether to condition the noise injection on the residual connection."
+    zero_initialised_encoder_adapters: list[str] = Field(default_factory=list)
+    "Datasets whose encoded latent contribution passes through a zero-initialized linear adapter."
+    output_residual: dict[str, ResidualConnectionSchema] = Field(default_factory=dict)
+    "Additional per-dataset residual connections applied after decoding."
+    absolute_lead_noise_output_conditioning: dict = Field(default_factory=dict)
+    "Absolute-lead and member-noise conditioning applied to selected decoder outputs."
 
 
 class TransportModelSchema(BaseModelSchema):

@@ -32,6 +32,7 @@ class BaseImputer(BasePreprocessor, ABC):
         config=None,
         data_indices: Optional[IndexCollection] = None,
         statistics: Optional[dict] = None,
+        temporal_forward_fill: bool = False,
     ) -> None:
         """Initialize the imputer.
 
@@ -45,6 +46,7 @@ class BaseImputer(BasePreprocessor, ABC):
             Data statistics dictionary
         """
         super().__init__(config, data_indices, statistics)
+        self.temporal_forward_fill = temporal_forward_fill
 
         # These masks describe the current batch or local batch shard of the rank.
         self.nan_locations: torch.Tensor | None = None
@@ -199,6 +201,14 @@ class BaseImputer(BasePreprocessor, ABC):
         if skip_imputation:
             return x
 
+        if self.temporal_forward_fill:
+            for time_index in range(1, x.shape[1]):
+                x[:, time_index] = torch.where(
+                    torch.isnan(x[:, time_index]),
+                    x[:, time_index - 1],
+                    x[:, time_index],
+                )
+
         # recalculate NaN locations every forward pass and save for backward pass
         nan_locations = self.get_nans(x)
 
@@ -300,8 +310,9 @@ class InputImputer(BaseImputer):
         config=None,
         data_indices: Optional[IndexCollection] = None,
         statistics: Optional[dict] = None,
+        temporal_forward_fill: bool = False,
     ) -> None:
-        super().__init__(config, data_indices, statistics)
+        super().__init__(config, data_indices, statistics, temporal_forward_fill=temporal_forward_fill)
 
         if isinstance(statistics, DictConfig):
             statistics = OmegaConf.to_container(statistics, resolve=True)

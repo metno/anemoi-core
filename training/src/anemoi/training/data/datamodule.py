@@ -51,6 +51,7 @@ class AnemoiDatasetsDataModule(pl.LightningDataModule):
         self.test_dataloader_config = get_multiple_datasets_config(self.config.dataloader.test)
 
         self.dataset_names = list(self.train_dataloader_config.keys())
+        self.task.set_dataset_offsets(self.train_dataloader_config)
         LOGGER.info("Initializing multi-dataset module with datasets: %s", self.dataset_names)
 
         # Set training end dates if not specified for each dataset
@@ -129,12 +130,28 @@ class AnemoiDatasetsDataModule(pl.LightningDataModule):
         shuffle: bool = True,
         label: str = "generic",
     ) -> MultiDataset:
-        data_readers = {name: create_dataset(data_reader, task=self.task) for name, data_reader in config.items()}
-        relative_date_indices = compute_relative_date_indices(self.task, data_readers, mode=label)
+        data_readers = {}
+        for name, data_reader in config.items():
+            reader_config = dict(data_reader)
+            reader_config.pop("input_offsets", None)
+            reader_config.pop("target_offsets", None)
+            data_readers[name] = create_dataset(reader_config, task=self.task)
+        dataset_offsets = None
+        if self.task.dataset_input_offsets:
+            dataset_offsets = {name: self.task.get_dataset_offsets(name, mode=label) for name in data_readers}
+            relative_date_indices = {}
+        else:
+            relative_date_indices = compute_relative_date_indices(self.task, data_readers, mode=label)
         dataset_options = {}
         dataloader_config = getattr(getattr(self, "config", None), "dataloader", {})
         if dataloader_config.get("fake_dataloading", False):
             dataset_options["fake_dataloading"] = True
+        if dataset_offsets is not None:
+            dataset_options["dataset_offsets"] = dataset_offsets
+        if dataloader_config.get("date_filter") is not None:
+            dataset_options["date_filter"] = dataloader_config.date_filter
+        if label == "training" and dataloader_config.get("epoch_sample") is not None:
+            dataset_options["epoch_sample"] = dataloader_config.epoch_sample
 
         return MultiDataset(
             data_readers=data_readers,
@@ -164,7 +181,7 @@ class AnemoiDatasetsDataModule(pl.LightningDataModule):
             dataset.set_epoch(
                 self.epoch,
                 rollout=len(tuple(self.task.steps(label))),
-                relative_date_indices=compute_relative_date_indices(
+                relative_date_indices=None if self.task.dataset_input_offsets else compute_relative_date_indices(
                     self.task,
                     dataset.data_readers,
                     mode=label,

@@ -17,6 +17,7 @@ from .builders.icon import ICONTopologicalDecoderEdges
 from .builders.icon import ICONTopologicalEncoderEdges
 from .builders.icon import ICONTopologicalProcessorEdges
 from .builders.multi_scale import MultiScaleEdges
+from .builders.triangulation import TriangulationEdges
 
 __all__ = [
     "KNNEdges",
@@ -24,6 +25,7 @@ __all__ = [
     "CutOffEdges",
     "HEALPixMultiScaleEdges",
     "MultiScaleEdges",
+    "TriangulationEdges",
     "ReversedCutOffEdges",
     "ReversedKNNEdges",
     "ICONTopologicalProcessorEdges",

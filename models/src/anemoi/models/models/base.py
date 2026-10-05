@@ -10,6 +10,7 @@
 
 import logging
 from abc import abstractmethod
+from collections.abc import Mapping
 from typing import Optional
 
 import torch
@@ -45,8 +46,8 @@ class BaseGraphModel(nn.Module):
         model_config: DictConfig,
         data_indices: dict,
         statistics: dict,
-        n_step_input: int,
-        n_step_output: int,
+        n_step_input: int | Mapping[str, int],
+        n_step_output: int | Mapping[str, int],
         graph_data: HeteroData,
     ) -> None:
         """Initializes the graph neural network.
@@ -229,7 +230,10 @@ class BaseGraphModel(nn.Module):
 
     def _calculate_input_dim(self, dataset_name: str) -> int:
         """Calculate the encoder input dimension for a given dataset."""
-        return self.n_step_input * self.num_input_channels[dataset_name] + self.node_attributes.attr_ndims[dataset_name]
+        return (
+            self._get_n_step_input(dataset_name) * self.num_input_channels[dataset_name]
+            + self.node_attributes.attr_ndims[dataset_name]
+        )
 
     def _calculate_input_dim_latent(self) -> int:
         """Calculate the latent input dimension."""
@@ -254,7 +258,19 @@ class BaseGraphModel(nn.Module):
 
     def _calculate_output_dim(self, dataset_name: str) -> int:
         """Calculate the decoder output dimension for a given dataset."""
-        return self.n_step_output * self.num_output_channels[dataset_name]
+        return self._get_n_step_output(dataset_name) * self.num_output_channels[dataset_name]
+
+    def _get_n_step_input(self, dataset_name: str) -> int:
+        """Return the number of input steps for one dataset."""
+        if isinstance(self.n_step_input, Mapping):
+            return int(self.n_step_input[dataset_name])
+        return int(self.n_step_input)
+
+    def _get_n_step_output(self, dataset_name: str) -> int:
+        """Return the number of output steps for one dataset."""
+        if isinstance(self.n_step_output, Mapping):
+            return int(self.n_step_output[dataset_name])
+        return int(self.n_step_output)
 
     def _assert_matching_indices(self, data_indices: dict) -> None:
         # Multi-dataset: check assertions for each dataset

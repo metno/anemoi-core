@@ -102,6 +102,10 @@ class HEALPixMultiScaleEdgesSchema(BaseModel):
     "Mask to apply to target nodes of the edges. Default to None."
 
 
+class TriangulationEdgeSchema(BaseModel):
+    target_: Literal["anemoi.graphs.edges.TriangulationEdges"] = Field(..., alias="_target_")
+
+
 class ICONTopologicalEdgeSchema(BaseModel):
     target_: Literal[
         "anemoi.graphs.edges.ICONTopologicalProcessorEdges",
@@ -128,6 +132,7 @@ EdgeBuilderSchemas = Annotated[
     | MutualKNNEdgeSchema
     | CutoffEdgeSchema
     | MultiScaleEdgeSchema
+    | TriangulationEdgeSchema
     | HEALPixMultiScaleEdgesSchema
     | ICONTopologicalEdgeSchema,
     Field(discriminator="target_"),

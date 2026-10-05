@@ -95,8 +95,15 @@ class BaseLatentAggregator(nn.Module, ABC):
 class SumAggregator(BaseLatentAggregator):
     """Sum latents element-wise."""
 
-    def __init__(self, *, input_channels: int, source_channels: Mapping[str, int]) -> None:
+    def __init__(
+        self,
+        *,
+        input_channels: int,
+        source_channels: Mapping[str, int],
+        sequential: bool = False,
+    ) -> None:
         super().__init__(input_channels=input_channels, source_channels=source_channels)
+        self.sequential = sequential
         self._hidden_dim = next(iter(self.source_channels.values()))
         if any(channels != self._hidden_dim for channels in self.source_channels.values()):
             raise ValueError(
@@ -116,6 +123,11 @@ class SumAggregator(BaseLatentAggregator):
     ) -> Tensor:
         if len(source_latents) == 1:
             return source_latents[0]
+        if self.sequential:
+            output = source_latents[0]
+            for latent in source_latents[1:]:
+                output = output + latent
+            return output
         return torch.stack(tuple(source_latents), dim=0).sum(dim=0)
 
 

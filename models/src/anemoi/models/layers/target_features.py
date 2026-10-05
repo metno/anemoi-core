@@ -151,7 +151,8 @@ class InputForcingsFeature(DecodingTargetFeature):
 
     @cached_property
     def dim(self) -> int:
-        return self.model.n_step_input * self.model.num_input_channels_forcings[self.datasets_names[0]]
+        dataset_name = self.datasets_names[0]
+        return self.model._get_n_step_input(dataset_name) * self.model.num_input_channels_forcings[dataset_name]
 
     def _compute(
         self, x_input_data: Tensor, x_encoded_data: Tensor | None, batch_size: int, dataset_name: str
@@ -178,7 +179,8 @@ class PrognosticsFeature(DecodingTargetFeature):
 
     @cached_property
     def dim(self) -> int:
-        return self.model.n_step_input * self.model.num_input_channels_prognostic[self.datasets_names[0]]
+        dataset_name = self.datasets_names[0]
+        return self.model._get_n_step_input(dataset_name) * self.model.num_input_channels_prognostic[dataset_name]
 
     def _compute(
         self, x_input_data: Tensor, x_encoded_data: Tensor | None, batch_size: int, dataset_name: str

@@ -260,6 +260,7 @@ class PreprocessorSchema(BaseModel, validate_assignment=False):
     "Processor object from anemoi.models.preprocessing.[normalizer|imputer|remapper]."
     config: Union[dict, NormalizerSchema, ImputerSchema, PostprocessorSchema, RemapperSchema]
     "Target schema containing processor methods."
+    temporal_forward_fill: bool = False
 
     @model_validator(mode="after")
     def schema_consistent_with_target(self) -> type["PreprocessorSchema"]:

@@ -78,6 +78,7 @@ class BaseForecaster(BaseTask):
         rollout_shift: datetime.timedelta,
         rollout: dict | None = None,
         validation_rollout: int | None = None,
+        fixed_input_window_datasets: list[str] | None = None,
         **kwargs,
     ) -> None:
 
@@ -93,6 +94,7 @@ class BaseForecaster(BaseTask):
         self._rollout_shift = rollout_shift
         self.rollout = RolloutConfig(**(rollout or {}))
         self.validation_rollout = validation_rollout
+        self.fixed_input_window_datasets = set(fixed_input_window_datasets or [])
         self._plot_adapter = ForecasterPlotAdapter(self)
 
     def steps(self, mode: str = "training") -> tuple[dict[str, int], ...]:
@@ -166,6 +168,42 @@ class BaseForecaster(BaseTask):
     ) -> dict[str, torch.Tensor]:
         """Advance the input state for the next rollout step."""
         for dataset_name in x:
+            if dataset_name in self.dataset_input_offsets:
+                if dataset_name in self.fixed_input_window_datasets:
+                    continue
+                input_offsets = self.dataset_input_offsets[dataset_name]
+                current_offsets = [offset + rollout_step * self._rollout_shift for offset in input_offsets]
+                next_offsets = [offset + (rollout_step + 1) * self._rollout_shift for offset in input_offsets]
+                available = self.get_dataset_offsets(dataset_name)
+                output_offsets = self.get_output_offsets(rollout_step=rollout_step)
+                prediction = y_pred.get(dataset_name)
+                indices = data_indices[dataset_name]
+                next_steps = []
+                for offset in next_offsets:
+                    if offset in current_offsets:
+                        next_steps.append(x[dataset_name][:, current_offsets.index(offset)].clone())
+                        continue
+                    earlier = [i for i, time in enumerate(available) if time <= offset]
+                    if not earlier:
+                        raise ValueError(f"No available forcing for {dataset_name!r} at {offset}")
+                    truth = batch[dataset_name][:, earlier[-1]]
+                    state = truth[..., indices.data.input.full]
+                    if state.shape[1] != x[dataset_name].shape[2]:
+                        state = state.expand(-1, x[dataset_name].shape[2], -1, -1)
+                        truth = truth.expand(-1, x[dataset_name].shape[2], -1, -1)
+                    state = state.clone()
+                    if prediction is not None and offset in output_offsets:
+                        state[..., indices.model.input.prognostic] = prediction[
+                            :, output_offsets.index(offset), ..., indices.model.output.prognostic
+                        ]
+                    if output_mask is not None:
+                        state = output_mask[dataset_name].rollout_boundary(
+                            state, truth, indices,
+                            grid_shard_slice=None if grid_shard_slice is None else grid_shard_slice[dataset_name],
+                        )
+                    next_steps.append(state)
+                x[dataset_name] = torch.stack(next_steps, dim=1)
+                continue
             x[dataset_name] = self._advance_dataset_input(
                 x[dataset_name],
                 y_pred.get(dataset_name),
@@ -379,7 +417,26 @@ class OffsetForecaster(BaseForecaster):
         }
         dataset_names = md_dict["metadata_inference"]["dataset_names"]
         for dataset_name in dataset_names:
-            md_dict["metadata_inference"][dataset_name]["timesteps"].update(fc_timesteps)
+            dataset_timesteps = dict(fc_timesteps)
+            if dataset_name in self.dataset_input_offsets:
+                inputs = self.dataset_input_offsets[dataset_name]
+                outputs = [offset for offset in self._output_offsets if offset in self.dataset_target_offsets[dataset_name]]
+                advance_map = {"inin": [], "outin": []}
+                for new_idx, offset in enumerate(inputs):
+                    shifted = offset + self._rollout_shift
+                    if dataset_name in self.fixed_input_window_datasets:
+                        advance_map["inin"].append((new_idx, new_idx))
+                    elif shifted in outputs:
+                        advance_map["outin"].append((outputs.index(shifted), new_idx))
+                    else:
+                        old_idx = max(index for index, value in enumerate(inputs) if value <= shifted)
+                        advance_map["inin"].append((old_idx, new_idx))
+                dataset_timesteps["input_offsets"] = [
+                    frequency_to_string(offset) for offset in inputs
+                ]
+                dataset_timesteps["output_offsets"] = [frequency_to_string(offset) for offset in outputs]
+                dataset_timesteps["advance_map"] = advance_map
+            md_dict["metadata_inference"][dataset_name]["timesteps"].update(dataset_timesteps)
 
     def _advance_dataset_input(
         self,

@@ -90,6 +90,10 @@ class NativeDatasetSchema(BaseModel):
     "Starting datetime for sample of the dataset."
     end: str | int | None = Field(default=None)
     "Ending datetime [inclusive] for sample of the dataset."
+    input_offsets: list[str] | None = None
+    "Input times relative to forecast initialisation for mixed-frequency histories."
+    target_offsets: list[str] | None = None
+    "Target times relative to forecast initialisation, including auxiliary loss targets."
 
 
 class TrajectorySamplingSchema(PydanticBaseModel):

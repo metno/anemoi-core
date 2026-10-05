@@ -303,6 +303,8 @@ class BaseLossSchema(BaseModel):
     "Scalers to include in loss calculation"
     ignore_nans: bool = False
     "Allow nans in the loss and apply methods ignoring nans for measuring the loss."
+    validation_postprocess: bool = True
+    "Evaluate validation metrics in postprocessed rather than model space."
     predicted_variables: list[str] | None = None
     target_variables: list[str] | None = None
     check_variables_compatibility: CheckVariablesCompatibilitySchema = Field(
@@ -625,8 +627,21 @@ _LOSS_DISCRIMINATOR_TAGS = {
 }
 
 
+class NowcastingLossSchema(GenericSchema):
+    """Configuration for the selected lightning objectives."""
+
+    scalers: list[str] = Field(default_factory=list)
+    ignore_nans: bool = False
+    validation_postprocess: bool = True
+
+
 def _loss_discriminator(v: Any) -> str:
     target = v.get("_target_", "") if hasattr(v, "get") else getattr(v, "target_", "")
+    if target.rsplit(".", 1)[-1] in {
+        "LightningBinaryCrossEntropyLoss", "LightningEnsembleBinaryCrossEntropyLoss",
+        "LightningStormAreaEnsembleBinaryCrossEntropyLoss", "LightningEnsembleSoftCSILoss",
+    }:
+        return "nowcasting"
     return _LOSS_DISCRIMINATOR_TAGS.get(target, "base")
 
 
@@ -655,7 +670,8 @@ class CombinedLossSchema(BaseLossSchema):
             | Annotated[GraphEdgeEnergyScoreLossSchema, Tag("graph_edge_energy_score")]
             | Annotated[SpectralLossSchema, Tag("spectral")]
             | Annotated[MultiScaleLossSchema, Tag("multiscale")]
-            | Annotated[TimeAggregateLossWrapperSchema, Tag("time_aggregate")],
+            | Annotated[TimeAggregateLossWrapperSchema, Tag("time_aggregate")]
+            | Annotated[NowcastingLossSchema, Tag("nowcasting")],
             Discriminator(_loss_discriminator),
         ]
     ] = Field(min_length=1)
@@ -715,7 +731,8 @@ LossSchemas = Annotated[
     | Annotated[GraphEdgeEnergyScoreLossSchema, Tag("graph_edge_energy_score")]
     | Annotated[SpectralLossSchema, Tag("spectral")]
     | Annotated[TimeAggregateLossWrapperSchema, Tag("time_aggregate")]
-    | Annotated[MultiScaleLossSchema, Tag("multiscale")],
+    | Annotated[MultiScaleLossSchema, Tag("multiscale")]
+    | Annotated[NowcastingLossSchema, Tag("nowcasting")],
     Discriminator(_loss_discriminator),
 ]
 
@@ -817,7 +834,7 @@ class BaseTrainingSchema(BaseModel):
     "Groups for variable loss scaling"
     max_epochs: PositiveInt | None = None
     "Maximum number of epochs, stops earlier if max_steps is reached first."
-    max_steps: PositiveInt = 150000
+    max_steps: int = Field(default=150000, ge=-1)
     "Maximum number of steps, stops earlier if max_epochs is reached first."
     optimization: OptimizationSchema
     "Optimizer and LR scheduler configuration."

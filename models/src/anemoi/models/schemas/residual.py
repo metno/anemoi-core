@@ -29,6 +29,12 @@ class SkipConnectionSchema(BaseModel):
     )
 
 
+class ZeroConnectionSchema(BaseModel):
+    """Schema for a zero residual connection."""
+
+    target_: Literal["anemoi.models.layers.residual.ZeroConnection"] = Field(..., alias="_target_")
+
+
 class TruncationConfigDiskSchema(BaseModel):
     """File-based truncation config: projection matrices loaded from .npz files."""
 
@@ -143,7 +149,8 @@ class SpectralOrnsteinConnectionSchema(BaseModel):
 
 
 ResidualConnectionSchema = Annotated[
-    SkipConnectionSchema
+    ZeroConnectionSchema
+    | SkipConnectionSchema
     | TruncatedConnectionSchema
     | ScalarOrnsteinConnectionSchema
     | SpectralOrnsteinConnectionSchema,

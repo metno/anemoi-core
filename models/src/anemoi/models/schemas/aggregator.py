@@ -23,3 +23,5 @@ class DefinedAggregatorMethods(str, Enum):
 class AggregatorSchema(BaseModel):
     target_: DefinedAggregatorMethods = Field(..., alias="_target_")
     "Aggregator object from anemoi.models.layers.aggregator."
+    sequential: bool = False
+    "Use sequential addition for exact compatibility with models trained before latent aggregators."

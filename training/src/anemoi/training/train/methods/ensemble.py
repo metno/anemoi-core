@@ -251,7 +251,8 @@ class EnsembleTraining(BaseTrainingModule):
 
         task_steps = self.task.steps("training" if not validation_mode else "validation")
         for i, task_step_kwargs in enumerate(task_steps):
-            y_pred = self(x, **task_step_kwargs)
+            model_kwargs = {"reset_noise": i == 0} if self.task.dataset_input_offsets else {}
+            y_pred = self(x, **model_kwargs, **task_step_kwargs)
 
             y = self.task.get_targets(batch, **task_step_kwargs)
 
