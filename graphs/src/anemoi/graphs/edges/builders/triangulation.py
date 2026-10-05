@@ -37,10 +37,10 @@ class TriangulationEdges(BaseEdgeBuilder):
     def _empty() -> torch.Tensor:
         return torch.empty((2, 0), dtype=torch.int64)
 
-    def compute_edge_index(self, source_nodes: NodeStorage, target_nodes: NodeStorage) -> torch.Tensor:
-        assert source_nodes.num_nodes == target_nodes.num_nodes, "TriangulationEdges expects identical source/target sets."
+    def compute_edge_index_from_coords(self, source_coords: torch.Tensor, target_coords: torch.Tensor) -> torch.Tensor:
+        assert source_coords.shape == target_coords.shape, "TriangulationEdges expects identical source/target sets."
 
-        coords_rad = source_nodes.x.detach().cpu().numpy()
+        coords_rad = source_coords.detach().cpu().numpy()
         num_nodes = int(coords_rad.shape[0])
         if num_nodes < 3:
             LOGGER.warning("TriangulationEdges requires >=3 nodes. Received %d nodes; no edges will be created.", num_nodes)
@@ -63,3 +63,6 @@ class TriangulationEdges(BaseEdgeBuilder):
         edge_index = torch.from_numpy(np.unique(directed_edges, axis=0).T)
         LOGGER.info("TriangulationEdges created %d directed edges from %d nodes.", edge_index.shape[1], num_nodes)
         return edge_index.to(torch.int64)
+
+    def compute_edge_index(self, source_nodes: NodeStorage, target_nodes: NodeStorage) -> torch.Tensor:
+        return self.compute_edge_index_from_coords(source_nodes.x, target_nodes.x)
