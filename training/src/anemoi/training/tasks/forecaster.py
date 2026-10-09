@@ -25,22 +25,49 @@ LOGGER = logging.getLogger(__name__)
 class RolloutConfig:
     """Rollout configuration for autoregressive training."""
 
-    def __init__(self, start: int = 1, epoch_increment: int = 0, maximum: int = 1) -> None:
-        """Initialize rollout configuration."""
+    def __init__(
+        self,
+        start: int = 1,
+        epoch_increment: int = 0,
+        maximum: int = 1,
+        epochs_per_window: list[int] | None = None,
+    ) -> None:
+        """Initialize rollout configuration.
+
+        ``epoch_increment`` raises the window by one at the end of every epoch where
+        ``epoch % epoch_increment == 0`` (epoch 0 included, so the first window lasts one epoch).
+        ``epochs_per_window`` is an explicit alternative: the number of epochs spent at ``start``,
+        ``start + 1``, ... before the next increase; the last window (``maximum``) runs until the
+        end of training. E.g. ``start=2, epochs_per_window=[2, 2], maximum=4``: rollout 2 for epochs
+        0-1, 3 for epochs 2-3, 4 from epoch 4. The two options are mutually exclusive.
+        """
         self.start = start
         self.epoch_increment = epoch_increment
         self.maximum = maximum
+        self.epochs_per_window = list(epochs_per_window) if epochs_per_window else None
+        if self.epochs_per_window and self.epoch_increment > 0:
+            msg = "rollout: use either 'epoch_increment' or 'epochs_per_window', not both."
+            raise ValueError(msg)
+        if self.epochs_per_window and any(n <= 0 for n in self.epochs_per_window):
+            msg = f"rollout: 'epochs_per_window' must be positive, got {self.epochs_per_window}."
+            raise ValueError(msg)
         self.step = self.start
         self._last_increased_epoch: int = -1
 
+    @property
+    def increases_over_epochs(self) -> bool:
+        """Whether the window changes during training (dataloaders must then be rebuilt per epoch)."""
+        return self.epoch_increment > 0 or bool(self.epochs_per_window)
+
     def should_increase(self, current_epoch: int) -> bool:
         """Check if rollout should be increased at the end of the current epoch."""
-        return (
-            self.epoch_increment > 0
-            and current_epoch % self.epoch_increment == 0
-            and self.step < self.maximum
-            and current_epoch != self._last_increased_epoch
-        )
+        if self.step >= self.maximum or current_epoch == self._last_increased_epoch:
+            return False
+        if self.epochs_per_window:
+            # increase at the end of the last epoch of each window: epochs 0..n1-1 -> start, n1..n1+n2-1 -> start+1, ...
+            boundaries = [sum(self.epochs_per_window[: k + 1]) for k in range(len(self.epochs_per_window))]
+            return (current_epoch + 1) in boundaries
+        return self.epoch_increment > 0 and current_epoch % self.epoch_increment == 0
 
     def increase(self, current_epoch: int) -> None:
         """Increase the rollout window by one step."""

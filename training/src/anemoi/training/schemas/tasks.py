@@ -27,6 +27,9 @@ class RolloutSchema(BaseModel):
     "Number of epochs to increment the rollout."
     maximum: NonNegativeInt = Field(example=1)
     "Maximum number of rollouts."
+    epochs_per_window: list[PositiveInt] | None = None
+    """Explicit schedule: epochs spent at start, start+1, ... before each increase (the last window, maximum, runs to
+    the end). Mutually exclusive with epoch_increment > 0."""
 
 
 class ForecasterSchema(BaseModel):
