@@ -98,6 +98,94 @@ class RegularGridIndices(BaseNodeAttribute):
         return torch.from_numpy(indices)
 
 
+class LatticeIndices(BaseNodeAttribute):
+    """Row and column of every selected node on a regular projected lattice.
+
+    Unlike :class:`RegularGridIndices`, which keeps only the largest complete rectangle, this
+    attribute places *all* selected nodes: the nodes are projected with ``proj4_string``, the
+    lattice origin is the minimum projected x and y of the selected nodes, and every node is
+    rounded to its nearest lattice point ``(row, column)`` with the given spacings. A node further
+    than ``absolute_tolerance`` from its lattice point, or two nodes in one cell, raise an error,
+    so the attribute is only built for data on a true regular grid (with or without holes).
+    Unselected nodes receive ``(-1, -1)``.
+
+    Used by ``anemoi.models.layers.ensemble.LatticeNoiseConditioning`` to draw and smooth noise
+    on the data grid itself.
+    """
+
+    def __init__(
+        self,
+        proj4_string: str,
+        x_spacing: float,
+        y_spacing: float | None = None,
+        mask_node_attr_name: str | None = None,
+        absolute_tolerance: float = 10.0,
+    ) -> None:
+        super().__init__(norm=None, dtype="int64")
+        self.target_crs = CRS.from_user_input(proj4_string)
+        self.x_spacing = float(x_spacing)
+        self.y_spacing = float(x_spacing if y_spacing is None else y_spacing)
+        self.mask_node_attr_name = mask_node_attr_name
+        self.absolute_tolerance = float(absolute_tolerance)
+
+    def get_raw_values(self, nodes: NodeStorage, **kwargs) -> torch.Tensor:
+        """Project the selected nodes and round them to the lattice."""
+        coordinates = nodes.x.detach().cpu().numpy()
+        if coordinates.ndim != 2 or coordinates.shape[1] != 2:
+            raise ValueError(f"Node coordinates must have shape (N, 2), got {coordinates.shape}.")
+
+        num_nodes = len(coordinates)
+        candidate_indices = np.arange(num_nodes)
+        if self.mask_node_attr_name is not None:
+            if self.mask_node_attr_name not in nodes:
+                raise ValueError(f"Node storage has no mask attribute {self.mask_node_attr_name!r}.")
+            source_mask = nodes[self.mask_node_attr_name].detach().cpu().numpy().astype(bool).squeeze()
+            if source_mask.ndim != 1 or len(source_mask) != len(coordinates):
+                raise ValueError(
+                    f"Mask attribute {self.mask_node_attr_name!r} must have one value per node, "
+                    f"got shape {source_mask.shape}."
+                )
+            candidate_indices = candidate_indices[source_mask]
+            coordinates = coordinates[source_mask]
+
+        indices = np.full((num_nodes, 2), -1, dtype=np.int64)
+        if len(candidate_indices) == 0:
+            LOGGER.warning("LatticeIndices: no nodes selected, all indices are -1.")
+            return torch.from_numpy(indices)
+
+        latitudes, longitudes = np.rad2deg(coordinates).T
+        transformer = Transformer.from_crs("EPSG:4326", self.target_crs, always_xy=True)
+        x, y = transformer.transform(longitudes, latitudes)
+        x0, y0 = x.min(), y.min()
+        columns = np.rint((x - x0) / self.x_spacing).astype(np.int64)
+        rows = np.rint((y - y0) / self.y_spacing).astype(np.int64)
+        residual = np.maximum(np.abs(x - (x0 + columns * self.x_spacing)), np.abs(y - (y0 + rows * self.y_spacing)))
+        if residual.max() > self.absolute_tolerance:
+            raise ValueError(
+                f"{int((residual > self.absolute_tolerance).sum())} selected nodes are further than "
+                f"{self.absolute_tolerance} m from the ({self.x_spacing} x {self.y_spacing}) m lattice "
+                f"(max {residual.max():.2f} m): the nodes are not on a regular grid in {self.target_crs.to_string()}."
+            )
+        num_columns = int(columns.max()) + 1
+        cells = rows * num_columns + columns
+        if len(np.unique(cells)) != len(cells):
+            raise ValueError("Two selected nodes map to the same lattice cell.")
+
+        indices[candidate_indices, 0] = rows
+        indices[candidate_indices, 1] = columns
+        LOGGER.info(
+            "Lattice in %s: (y=%d, x=%d) cells, %d of %d nodes on it (%.0f %% filled), max residual %.2f m.",
+            self.target_crs.to_string(),
+            int(rows.max()) + 1,
+            num_columns,
+            len(candidate_indices),
+            num_nodes,
+            100.0 * len(candidate_indices) / ((int(rows.max()) + 1) * num_columns),
+            residual.max(),
+        )
+        return torch.from_numpy(indices)
+
+
 class BaseAnemoiDatasetVariable(BooleanBaseNodeAttribute):
     """Base class for computing mask based on a variable in an Anemoi dataset."""
 

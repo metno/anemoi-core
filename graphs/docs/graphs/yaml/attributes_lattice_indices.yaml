@@ -1,0 +1,13 @@
+nodes:
+  data:
+    node_builder:
+      _target_: anemoi.graphs.nodes.ZarrDatasetNodes
+      dataset: dataset.zarr
+    attributes:
+      lattice_ij:
+        _target_: anemoi.graphs.nodes.attributes.LatticeIndices
+        proj4_string: "+proj=stere +lat_0=90 +lat_ts=90 +lon_0=-30 +x_0=172840.374543307 +y_0=645049.059394855 +R=6371229 +units=m +no_defs"
+        x_spacing: 2500.0          # m, in the projection
+        y_spacing: 2500.0
+        mask_node_attr_name: cutout_mask   # only these nodes are placed on the lattice, the others get (-1, -1)
+        absolute_tolerance: 10.0   # m, maximum distance of a node from its lattice point
