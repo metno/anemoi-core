@@ -73,6 +73,16 @@ class AnemoiEnsModelEncProcDec(AnemoiModelEncProcDec):
             sparse_projector_num_chunks=model_config.model.get("sparse_projector", {}).get("num_chunks", 1),
         )
 
+        # Optional second noise source on the data nodes, fed to the decoder as the destination-side
+        # conditioning of its mapper block (decoder layer_kernels.LayerNorm = ConditionalLayerNorm,
+        # decoder.cond_src = False). See anemoi.models.layers.ensemble.LatticeNoiseConditioning.
+        decoder_noise_cfg = model_config.model.get("decoder_noise_injector", None)
+        self.decoder_noise_injector = (
+            instantiate(decoder_noise_cfg, _recursive_=False, graph_data=self._graph_data)
+            if decoder_noise_cfg
+            else None
+        )
+
     def _calculate_input_dim(self, dataset_name: str) -> int:
         base_input_dim = super()._calculate_input_dim(dataset_name)
         base_input_dim += 1  # for forecast step (fcstep)
@@ -320,6 +330,20 @@ class AnemoiEnsModelEncProcDec(AnemoiModelEncProcDec):
                 edges=dec_edge_shard_sizes,
             )
 
+            decoder_kwargs = {}
+            if self.decoder_noise_injector is not None:
+                # conditioning on the data nodes only (source side None); sharded like x_data_latent
+                decoder_kwargs["cond"] = (
+                    None,
+                    self.decoder_noise_injector(
+                        batch_size=batch_size,
+                        ensemble_size=ensemble_size,
+                        grid_shard_sizes=shard_sizes_data_dict[dataset_name],
+                        model_comm_group=model_comm_group,
+                        device=x_latent_proc.device,
+                    ),
+                )
+
             x_out = self.decoder[dataset_name](
                 (x_latent_proc, x_data_latent_dict[dataset_name]),
                 batch_size=batch_ens_size,
@@ -328,6 +352,7 @@ class AnemoiEnsModelEncProcDec(AnemoiModelEncProcDec):
                 edge_index=decoder_edge_index,
                 model_comm_group=model_comm_group,
                 keep_x_dst_sharded=in_out_sharded[dataset_name],  # keep x_out sharded iff in_out_sharded
+                **decoder_kwargs,
             )
 
             x_out_dict[dataset_name] = self._assemble_output(

@@ -126,8 +126,11 @@ class GraphPartition:
         # subset conditioning if provided
         cond_subset = None
         if cond is not None:
-            cond_src, cond_dst = cond
-            cond_subset = (cond_src[src_ids], cond_dst[dst_range])
+            cond_src, cond_dst = cond  # either side may be None (no conditioning on that side)
+            cond_subset = (
+                cond_src[src_ids] if cond_src is not None else None,
+                cond_dst[dst_range] if cond_dst is not None else None,
+            )
 
         return (x_src_subset, x_dst_subset), edge_attr_subset, edge_index_subset, cond_subset
 
@@ -393,12 +396,16 @@ def shard_graph_to_local(
 
     x_src_local, edge_index, src_ids = _drop_unconnected_src_nodes(x_src_full, edge_index)
 
-    # same for conditioning [if cond is not None]
+    # same for conditioning [if cond is not None]; either side may be None. cond_dst follows x_dst:
+    # it must arrive sharded like x_dst, or unsharded when x_dst is unsharded (then both are sharded here)
     cond_local = None
     if cond is not None:
         cond_src, cond_dst = cond
-        cond_src_full = sync_tensor(cond_src, 0, shard_info.src_nodes, model_comm_group)
-        cond_local = (cond_src_full[src_ids], cond_dst)
+        if cond_src is not None:
+            cond_src = sync_tensor(cond_src, 0, shard_info.src_nodes, model_comm_group)[src_ids]
+        if cond_dst is not None and not shard_info.dst_is_sharded():
+            cond_dst = shard_tensor(cond_dst, 0, partition.dst_splits, model_comm_group)
+        cond_local = (cond_src, cond_dst)
 
     updated_shard_info = BipartiteGraphShardInfo(
         src_nodes=shard_info.src_nodes,

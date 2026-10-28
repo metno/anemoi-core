@@ -161,6 +161,7 @@ class GraphTransformerBaseMapper(BaseMapper, ABC):
         shard_strategy: str = "edges",
         graph_attention_backend: str = "triton",
         edge_pre_mlp: bool = False,
+        cond_src: bool = True,
         **kwargs,
     ) -> None:
         """Initialize GraphTransformerBaseMapper.
@@ -203,6 +204,8 @@ class GraphTransformerBaseMapper(BaseMapper, ABC):
             Backend to use for graph transformer conv, options are "triton" and "pyg"
         edge_pre_mlp: bool, by default False
             Allow for edge feature mixing
+        cond_src: bool, by default True
+            Condition the source-side layer norms of the mapper block (see GraphTransformerMapperBlock)
         """
         super().__init__(
             in_channels_src=in_channels_src,
@@ -232,6 +235,7 @@ class GraphTransformerBaseMapper(BaseMapper, ABC):
             shard_strategy=shard_strategy,
             graph_attention_backend=graph_attention_backend,
             edge_pre_mlp=edge_pre_mlp,
+            cond_src=cond_src,
         )
 
         self.offload_layers(cpu_offload)

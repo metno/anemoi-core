@@ -886,6 +886,7 @@ class GraphTransformerMapperBlock(GraphTransformerBaseBlock):
         shard_strategy: str = "edges",
         graph_attention_backend: str = "triton",
         edge_pre_mlp: bool = False,
+        cond_src: bool = True,
         **kwargs,
     ) -> None:
         """Initialize GraphTransformerBlock.
@@ -917,6 +918,10 @@ class GraphTransformerMapperBlock(GraphTransformerBaseBlock):
             Backend to use for graph transformer conv, options are "triton" and "pyg"
         edge_pre_mlp: bool, by default False
             Allow for edge feature mixing
+        cond_src: bool, by default True
+            Condition the source-side layer norms too. With False the source-side norms are plain
+            torch LayerNorms (only the destination side follows layer_kernels.LayerNorm), so a
+            conditioning tensor is only needed for the destination nodes: forward(cond=(None, cond_dst)).
         """
 
         super().__init__(
@@ -935,7 +940,8 @@ class GraphTransformerMapperBlock(GraphTransformerBaseBlock):
             **kwargs,
         )
 
-        LayerNorm = layer_kernels.LayerNorm
+        self.cond_src = cond_src
+        LayerNorm = layer_kernels.LayerNorm if cond_src else nn.LayerNorm
 
         self.layer_norm_attention_src = LayerNorm(normalized_shape=in_channels)
         self.layer_norm_attention_dest = self.layer_norm_attention
@@ -975,9 +981,9 @@ class GraphTransformerMapperBlock(GraphTransformerBaseBlock):
     ):
         x_skip = x
 
-        # In case we have conditionings we pass these to the layer norm
-        cond_src_kwargs = {"cond": cond[0]} if cond is not None else {}
-        cond_dst_kwargs = {"cond": cond[1]} if cond is not None else {}
+        # In case we have conditionings we pass these to the layer norm (either side may be None)
+        cond_src_kwargs = {"cond": cond[0]} if cond is not None and cond[0] is not None else {}
+        cond_dst_kwargs = {"cond": cond[1]} if cond is not None and cond[1] is not None else {}
 
         x = (
             self.layer_norm_attention_src(x[0], **cond_src_kwargs),
