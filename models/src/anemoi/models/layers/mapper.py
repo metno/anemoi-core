@@ -708,6 +708,107 @@ class GraphTransformerBackwardMapper(GraphTransformerBaseMapper):
         return self.node_data_extractor(x_dst)
 
 
+class GraphTransformerRefinerMapper(GraphTransformerBaseMapper):
+    """Graph Transformer mapper on one node set (data -> data), used as a refiner stage after the decoder.
+
+    Ported from ecmwf/anemoi-core ``feat/optional-refiner-main`` (GraphTransformerRefinerMapper). Runs without the
+    source/destination embedding layers when the input channels already equal ``hidden_dim``; the output projection
+    (LayerNorm + Linear to ``out_channels_dst``) is optional, so blocks can be chained at ``hidden_dim`` width.
+    """
+
+    def __init__(
+        self,
+        *,
+        in_channels_src: int,
+        in_channels_dst: int,
+        hidden_dim: int,
+        out_channels_dst: Optional[int] = None,
+        num_chunks: int,
+        num_heads: int,
+        mlp_hidden_ratio: float,
+        edge_dim: int,
+        attn_channels: Optional[int] = None,
+        qk_norm: bool = False,
+        mlp_implementation: MLPImplementation = "mlp",
+        use_src_embedding: bool = False,
+        use_dst_embedding: bool = False,
+        use_output_projection: Optional[bool] = None,
+        initialise_data_extractor_zero: bool = False,
+        cpu_offload: bool = False,
+        layer_kernels: DotDict = None,
+        shard_strategy: str = "edges",
+        graph_attention_backend: str = "triton",
+        edge_pre_mlp: bool = False,
+        **kwargs,
+    ) -> None:
+        super().__init__(
+            in_channels_src=in_channels_src,
+            in_channels_dst=in_channels_dst,
+            hidden_dim=hidden_dim,
+            out_channels_dst=out_channels_dst,
+            num_chunks=num_chunks,
+            cpu_offload=cpu_offload,
+            qk_norm=qk_norm,
+            attn_channels=attn_channels,
+            num_heads=num_heads,
+            mlp_hidden_ratio=mlp_hidden_ratio,
+            edge_dim=edge_dim,
+            mlp_implementation=mlp_implementation,
+            layer_kernels=layer_kernels,
+            shard_strategy=shard_strategy,
+            graph_attention_backend=graph_attention_backend,
+            edge_pre_mlp=edge_pre_mlp,
+            **kwargs,
+        )
+        Linear = self.layer_factory.Linear
+        self.use_src_embedding = use_src_embedding
+        self.use_dst_embedding = use_dst_embedding
+        self.use_output_projection = (
+            out_channels_dst is not None if use_output_projection is None else use_output_projection
+        )
+        if self.use_src_embedding:
+            self.emb_nodes_src = Linear(self.in_channels_src, self.hidden_dim)
+        else:
+            assert self.in_channels_src == self.hidden_dim, (
+                "When use_src_embedding=False, in_channels_src must equal hidden_dim. "
+                f"Got in_channels_src={self.in_channels_src}, hidden_dim={self.hidden_dim}."
+            )
+            self.emb_nodes_src = nn.Identity()
+        if self.use_dst_embedding:
+            self.emb_nodes_dst = Linear(self.in_channels_dst, self.hidden_dim)
+        else:
+            assert self.in_channels_dst == self.hidden_dim, (
+                "When use_dst_embedding=False, in_channels_dst must equal hidden_dim. "
+                f"Got in_channels_dst={self.in_channels_dst}, hidden_dim={self.hidden_dim}."
+            )
+            self.emb_nodes_dst = nn.Identity()  # replaces the Linear created by the base class
+        if self.use_output_projection:
+            if self.out_channels_dst is None:
+                raise ValueError("out_channels_dst must be set when use_output_projection=True.")
+            self.node_data_extractor = nn.Sequential(
+                nn.LayerNorm(self.hidden_dim), nn.Linear(self.hidden_dim, self.out_channels_dst)
+            )
+            if initialise_data_extractor_zero:
+                for module in self.node_data_extractor.modules():
+                    if isinstance(module, nn.Linear):
+                        nn.init.constant_(module.weight, 0.0)
+                        if module.bias is not None:
+                            nn.init.constant_(module.bias, 0.0)
+        else:
+            if self.out_channels_dst is not None:
+                raise ValueError("out_channels_dst must be None when use_output_projection=False.")
+            if initialise_data_extractor_zero:
+                raise ValueError("initialise_data_extractor_zero requires use_output_projection=True.")
+            self.node_data_extractor = nn.Identity()
+
+    def pre_process(self, x):
+        x_src, x_dst = x
+        return self.emb_nodes_src(x_src), self.emb_nodes_dst(x_dst)
+
+    def post_process(self, x_dst):
+        return self.node_data_extractor(x_dst)
+
+
 class GNNBaseMapper(BaseMapper, ABC):
     """Base for Graph Neural Network Mapper from hidden -> data or data -> hidden."""
 

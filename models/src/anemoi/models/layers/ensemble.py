@@ -497,3 +497,79 @@ class LatticeNoiseConditioning(nn.Module):
         cond = checkpoint(self.noise_mlp, full, use_reentrant=False)
         LOGGER.debug("decoder noise cond.shape = %s, norm: %.9e", cond.shape, torch.linalg.norm(cond))
         return cond
+
+
+class DataNodeNoise(nn.Module):
+    """Independent N(0, 1) noise per data node and ensemble member for the refiner stage (see
+    anemoi.models.models.optional_refiner).
+
+    ``noise_channels`` channels are drawn per node; the last ``smooth_channels`` of them are smoothed once over the
+    data -> data edges with the L2-row-normalised matrix (I + A), so the variance stays 1 while neighbouring nodes
+    become correlated (the correlation length follows the local grid spacing of the KNN graph). The noise is drawn in
+    full on every rank of the model communication group (same seed, as the processor noise) and returned as
+    ((batch ensemble grid), channels) in the sharding of the data nodes. No normalisation is applied downstream: the
+    amplitude seen by the refiner is set by the learned projection that follows.
+    """
+
+    def __init__(
+        self,
+        *,
+        noise_channels: int,
+        smooth_channels: int = 0,
+        noise_std: float = 1.0,
+        graph_data: Optional[HeteroData] = None,
+        edges_name: Optional[tuple[str, str, str]] = None,
+        data_nodes_name: str = "data",
+    ) -> None:
+        super().__init__()
+        assert noise_channels > 0 and 0 <= smooth_channels <= noise_channels, (noise_channels, smooth_channels)
+        self.noise_channels = int(noise_channels)
+        self.smooth_channels = int(smooth_channels)
+        self.noise_std = float(noise_std)
+        self.num_nodes = int(graph_data[data_nodes_name].num_nodes)
+        if self.smooth_channels > 0:
+            assert edges_name is not None and graph_data is not None, "smoothing needs the data -> data edges"
+            edge_index = graph_data[edges_name].edge_index.long()
+            n = self.num_nodes
+            loops = torch.arange(n, dtype=torch.long)
+            row = torch.cat([edge_index[1], loops])  # destination node receives from source node (+ itself)
+            col = torch.cat([edge_index[0], loops])
+            adj = torch.sparse_coo_tensor(torch.stack([row, col]), torch.ones(row.numel()), (n, n)).coalesce()
+            values = torch.ones_like(adj.values())  # duplicates (e.g. KNN self-neighbour) count once
+            deg = torch.zeros(n).index_add_(0, adj.indices()[0], values)
+            values = values / torch.sqrt(deg[adj.indices()[0]])  # L2-normalised rows: unit variance out
+            smooth = torch.sparse_coo_tensor(adj.indices(), values, (n, n)).coalesce().to_sparse_csr()
+            self.register_buffer("smooth_matrix", smooth, persistent=False)
+        LOGGER.info(
+            "refiner noise: %d channels per data node (%d smoothed over the data->data edges), std %.2f, %d nodes",
+            self.noise_channels,
+            self.smooth_channels,
+            self.noise_std,
+            self.num_nodes,
+        )
+
+    def forward(
+        self,
+        *,
+        batch_size: int,
+        ensemble_size: int,
+        grid_shard_sizes: ShardSizes,
+        model_comm_group: Optional[ProcessGroup] = None,
+        device: Optional[torch.device] = None,
+        noise_dtype: torch.dtype = torch.float32,
+    ) -> Tensor:
+        bse = batch_size * ensemble_size
+        noise = torch.randn((bse, self.num_nodes, self.noise_channels), dtype=noise_dtype, device=device)
+        noise.requires_grad = False
+        if self.smooth_channels > 0:
+            s = self.smooth_channels
+            flat = einops.rearrange(noise[..., -s:], "bse grid vars -> grid (bse vars)")
+            smoothed = torch.sparse.mm(self.smooth_matrix.to(device=flat.device, dtype=flat.dtype), flat)
+            noise = torch.cat(
+                [noise[..., : self.noise_channels - s], einops.rearrange(smoothed, "grid (bse vars) -> bse grid vars", bse=bse)],
+                dim=-1,
+            )
+        noise = einops.rearrange(noise, "bse grid vars -> (bse grid) vars") * self.noise_std
+        if grid_shard_sizes is not None and model_is_distributed(model_comm_group):
+            noise = shard_tensor(noise, 0, grid_shard_sizes, model_comm_group)
+        return noise

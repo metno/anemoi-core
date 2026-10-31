@@ -26,12 +26,13 @@ from anemoi.models.distributed.shapes import GraphShardInfo
 from anemoi.models.distributed.shapes import ShardSizes
 from anemoi.models.distributed.shapes import get_shard_sizes
 from anemoi.models.models import AnemoiModelEncProcDec
+from anemoi.models.models.optional_refiner import OptionalRefinerMixin
 from anemoi.utils.config import DotDict
 
 LOGGER = logging.getLogger(__name__)
 
 
-class AnemoiEnsModelEncProcDec(AnemoiModelEncProcDec):
+class AnemoiEnsModelEncProcDec(OptionalRefinerMixin, AnemoiModelEncProcDec):
     """Message passing graph neural network with ensemble functionality."""
 
     def __init__(
@@ -82,6 +83,10 @@ class AnemoiEnsModelEncProcDec(AnemoiModelEncProcDec):
             if decoder_noise_cfg
             else None
         )
+
+        # Optional refiner: message-passing blocks on data -> data edges after the decoder (see
+        # anemoi.models.models.optional_refiner); residual mode keeps the decoder unchanged.
+        self._build_optional_refiner_networks(model_config)
 
     def _calculate_input_dim(self, dataset_name: str) -> int:
         base_input_dim = super()._calculate_input_dim(dataset_name)
@@ -354,6 +359,19 @@ class AnemoiEnsModelEncProcDec(AnemoiModelEncProcDec):
                 keep_x_dst_sharded=in_out_sharded[dataset_name],  # keep x_out sharded iff in_out_sharded
                 **decoder_kwargs,
             )
+
+            if getattr(self, "refiner_enabled", False):
+                x_out = self._apply_optional_refiner(
+                    dataset_name=dataset_name,
+                    x_out=x_out,
+                    x_data_latent=x_data_latent_dict[dataset_name],
+                    batch_size=batch_size,
+                    ensemble_size=ensemble_size,
+                    batch_ens_size=batch_ens_size,
+                    shard_sizes_data=shard_sizes_data_dict[dataset_name],
+                    in_out_sharded=in_out_sharded[dataset_name],
+                    model_comm_group=model_comm_group,
+                )
 
             x_out_dict[dataset_name] = self._assemble_output(
                 x_out,
