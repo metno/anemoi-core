@@ -196,6 +196,10 @@ class DecodersSchema(BaseModel):
 
 
 class BaseModelSchema(PydanticBaseModel):
+    lightning_motion_head: Optional[dict[str, Any]] = None
+    "Optional post-rollout lightning motion head configuration."
+    precipitation_motion_head: Optional[dict[str, Any]] = None
+    "Optional post-rollout precipitation motion head configuration."
     keep_batch_sharded: bool = Field(default=True)
     "Keep the input batch and the output of the model sharded"
     sparse_projector: SparseProjectorSchema = Field(default_factory=SparseProjectorSchema)
