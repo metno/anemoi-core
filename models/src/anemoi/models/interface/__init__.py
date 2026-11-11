@@ -226,6 +226,10 @@ class AnemoiModelInterface(torch.nn.Module):
         if motion_config is not None:
             self.lightning_motion_head = instantiate(motion_config, _recursive_=False)
 
+        precipitation_config = getattr(self.config.model, "precipitation_motion_head", None)
+        if precipitation_config is not None:
+            self.precipitation_motion_head = instantiate(precipitation_config, _recursive_=False)
+
         # Use the forward method of the model directly
         self.forward = self.model.forward
 

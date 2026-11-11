@@ -10,6 +10,7 @@ from __future__ import annotations
 import numpy as np
 import torch
 from scipy import ndimage
+from scipy.interpolate import RegularGridInterpolator
 from torch import Tensor
 from torch import nn
 
@@ -140,12 +141,46 @@ class LightningMotionHead(nn.Module):
         source = [yy - steps * velocity[..., 1], xx - steps * velocity[..., 0]]
         return ndimage.map_coordinates(field, source, order=1, mode="constant", cval=0, prefilter=False)
 
-    def forward(self, prediction: Tensor, radar_history: Tensor, lightning_history: Tensor, lead_minutes) -> Tensor:
+    def _shared_source_coordinates(self, entry, coarse_map, geometry):
+        x, y, path_valid = coarse_map
+        cy, cx = np.indices(path_valid.shape, dtype=np.float32)
+        displacement = np.stack((x - cx, y - cy), axis=-1).astype(np.float64)
+        factor = entry["pooling_factor"]
+        radar_x, radar_y = geometry["radar_x"], geometry["radar_y"]
+        coarse_x = (radar_x.astype(np.float64) + .5) / factor - .5
+        coarse_y = (radar_y.astype(np.float64) + .5) / factor - .5
+        ix, iy = np.floor(coarse_x).astype(np.int64), np.floor(coarse_y).astype(np.int64)
+        height, width = path_valid.shape
+        inside = (ix >= 0) & (ix + 1 < width) & (iy >= 0) & (iy + 1 < height)
+        ix, iy = ix.clip(0, width - 2), iy.clip(0, height - 2)
+        finite = np.isfinite(displacement).all(axis=-1) & path_valid
+        supported = (geometry["radar_coverage"] & inside & finite[iy, ix] & finite[iy, ix + 1]
+            & finite[iy + 1, ix] & finite[iy + 1, ix + 1])
+        source_x, source_y = [radar + factor * ndimage.map_coordinates(displacement[..., component],
+            [coarse_y, coarse_x], order=1, mode="constant", cval=np.nan, prefilter=False)
+            for component, radar in enumerate((radar_x, radar_y))]
+        world = RegularGridInterpolator((geometry["sample_y"], geometry["sample_x"]), geometry["radar_world"],
+            bounds_error=False, fill_value=np.nan)(np.stack((source_y, source_x), axis=-1))
+        delta = (world - geometry["target_radar_world"]) / self.grid_size
+        yy, xx = np.indices(self._shape, dtype=np.float64)
+        source = np.stack((xx, yy), axis=-1) + delta
+        native_height, native_width = geometry["radar_shape"]
+        supported &= (np.isfinite(source).all(axis=-1) & (source_x >= 0) & (source_x <= native_width - 1)
+            & (source_y >= 0) & (source_y <= native_height - 1)
+            & (source[..., 0] >= 0) & (source[..., 0] <= xx.shape[1] - 1)
+            & (source[..., 1] >= 0) & (source[..., 1] <= yy.shape[0] - 1))
+        source[~supported] = np.stack((xx, yy), axis=-1)[~supported]
+        return source[..., 0].astype(np.float32), source[..., 1].astype(np.float32), supported
+
+    def forward(self, prediction: Tensor, radar_history: Tensor, lightning_history: Tensor, lead_minutes,
+                *, motion=None, geometry=None) -> Tensor:
         """Correct ``prediction[lead, member, node]`` using past ``history[time, node]``.
 
         The result is a CPU float32 tensor with the prediction shape. Analysis and
         unvalidated lead times remain NaN. All native fields must be gathered before
         calling the head; no communication or random sampling is performed here.
+        Optional shared precipitation maps sample the original issue guide once;
+        existing radar-history transport supplies values outside shared coverage.
         """
         if self._radar_index is None or self._lightning_index is None:
             raise RuntimeError("Call LightningMotionHead.set_grid before inference")
@@ -157,6 +192,15 @@ class LightningMotionHead(nn.Module):
         valid_leads = np.flatnonzero((leads > 0) & (leads <= self.max_lead_minutes))
         if not np.array_equal(leads[valid_leads], np.arange(5, 31, 5)):
             raise ValueError("Lightning motion requires every five-minute forecast through +30 minutes")
+        if (motion is None) != (geometry is None):
+            raise ValueError("Shared lightning motion requires both motion and geometry")
+        if motion is not None:
+            if (str(geometry["projection"]) != self.projection or float(geometry["grid_size"]) != self.grid_size
+                or tuple(geometry["lightning8_shape"]) != self._shape or not np.array_equal(geometry["origin"], self._origin)):
+                raise ValueError("Shared lightning geometry differs from the active projected grid")
+            if len(motion) != prediction.shape[1] or any(len(entry["backward_maps"]) < 6
+                or tuple(entry["native_shape"]) != tuple(geometry["radar_shape"]) for entry in motion):
+                raise ValueError("Shared lightning motion must match all members and six native-radar lead maps")
         radar = radar_history.detach().float().cpu().numpy()
         lightning = lightning_history.detach().float().cpu().numpy()
         radar = np.stack([self._aggregate(frame, self._radar_index) for frame in radar])
@@ -171,15 +215,24 @@ class LightningMotionHead(nn.Module):
         original = prediction.detach().float().cpu()
         output = torch.full_like(original, torch.nan)
         weight = float(self.history_weight.detach().cpu())
+        issue_guide = history.copy() if motion is not None else None
         for index in valid_leads:
             history = self._transport(history, velocity, 1)
             evidence = history.astype(np.float32).reshape(-1)[self._lightning_index[1]]
             evidence = evidence * np.float32(np.exp(-leads[index] / self.forecast_decay_minutes))
+            if motion is not None:
+                evidence = np.broadcast_to(evidence, (len(motion), evidence.size)).copy()
+                for member, entry in enumerate(motion):
+                    step = int(leads[index] // self.timestep_minutes) - 1
+                    x, y, supported = self._shared_source_coordinates(entry, entry["backward_maps"][step], geometry)
+                    shared = ndimage.map_coordinates(issue_guide, [y, x], order=1, mode="constant", cval=0, prefilter=False)
+                    shared = np.where(supported, shared, history).astype(np.float32)
+                    evidence[member] = shared.reshape(-1)[self._lightning_index[1]] * np.float32(np.exp(-leads[index] / self.forecast_decay_minutes))
             logits = original[index].numpy() / self.logit_scale * self.multiplier + self.bias
             probability = np.empty_like(logits, dtype=np.float32)
             positive = logits >= 0
             probability[positive] = 1 / (1 + np.exp(-logits[positive]))
             exp_values = np.exp(logits[~positive])
             probability[~positive] = exp_values / (1 + exp_values)
-            output[index] = torch.from_numpy((1 - weight) * probability + weight * evidence[None, :])
+            output[index] = torch.from_numpy((1 - weight) * probability + weight * (evidence[None, :] if motion is None else evidence))
         return output
