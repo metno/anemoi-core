@@ -539,7 +539,11 @@ class DataNodeNoise(nn.Module):
             deg = torch.zeros(n).index_add_(0, adj.indices()[0], values)
             values = values / torch.sqrt(deg[adj.indices()[0]])  # L2-normalised rows: unit variance out
             smooth = torch.sparse_coo_tensor(adj.indices(), values, (n, n)).coalesce().to_sparse_csr()
-            self.register_buffer("smooth_matrix", smooth, persistent=False)
+            # stored as dense CSR components, not as a sparse buffer: DDP's buffer broadcast (e.g. Lightning's DDP
+            # strategy in bris inference) cannot handle sparse tensors ("Sparse CSR tensors do not have is_contiguous")
+            self.register_buffer("smooth_crow", smooth.crow_indices(), persistent=False)
+            self.register_buffer("smooth_col", smooth.col_indices(), persistent=False)
+            self.register_buffer("smooth_val", smooth.values(), persistent=False)
         LOGGER.info(
             "refiner noise: %d channels per data node (%d smoothed over the data->data edges), std %.2f, %d nodes",
             self.noise_channels,
@@ -547,6 +551,17 @@ class DataNodeNoise(nn.Module):
             self.noise_std,
             self.num_nodes,
         )
+
+    def __setstate__(self, state: dict) -> None:
+        # pickled inference checkpoints written before the dense-component buffers hold the matrix as one sparse CSR
+        # buffer ``smooth_matrix``; convert it on load so that DDP buffer broadcasts (bris) see only dense tensors
+        super().__setstate__(state)
+        legacy = self._buffers.pop("smooth_matrix", None)
+        if legacy is not None and "smooth_crow" not in self._buffers:
+            legacy = legacy.to_sparse_csr() if legacy.layout != torch.sparse_csr else legacy
+            self.register_buffer("smooth_crow", legacy.crow_indices(), persistent=False)
+            self.register_buffer("smooth_col", legacy.col_indices(), persistent=False)
+            self.register_buffer("smooth_val", legacy.values(), persistent=False)
 
     def forward(
         self,
@@ -564,7 +579,11 @@ class DataNodeNoise(nn.Module):
         if self.smooth_channels > 0:
             s = self.smooth_channels
             flat = einops.rearrange(noise[..., -s:], "bse grid vars -> grid (bse vars)")
-            smoothed = torch.sparse.mm(self.smooth_matrix.to(device=flat.device, dtype=flat.dtype), flat)
+            n = self.num_nodes
+            smooth = torch.sparse_csr_tensor(
+                self.smooth_crow.to(flat.device), self.smooth_col.to(flat.device), self.smooth_val.to(device=flat.device, dtype=flat.dtype), (n, n)
+            )
+            smoothed = torch.sparse.mm(smooth, flat)
             noise = torch.cat(
                 [noise[..., : self.noise_channels - s], einops.rearrange(smoothed, "grid (bse vars) -> bse grid vars", bse=bse)],
                 dim=-1,

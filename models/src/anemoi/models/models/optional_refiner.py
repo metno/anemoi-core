@@ -38,6 +38,8 @@ Config (``model.refiner``)::
         mlp_hidden_ratio: 4
         layer_kernels: ...
       use_data_latent: true           # optional (residual mode): add W_lat * x_data_latent at the entrance
+      gate_init: 0.0                  # optional (residual mode): initial per-variable gate (0 = exact fork, see code comment)
+      out_init_scale: 1.0             # optional (residual mode): scale of the output projection's init (small with a non-zero gate)
       noise:                          # optional
         noise_channels: 8
         smooth_channels: 4
@@ -147,7 +149,23 @@ class OptionalRefinerMixin:
                 # (sign-like) step and perturb the output by O(lr * |h| * sqrt(channels)); a zero vector gate keeps the
                 # first-step perturbation at O(lr * |W h|) and ramps the branch in smoothly (ReZero-style).
                 self.refiner_out[dataset_name] = nn.Linear(channels, self.output_dim[dataset_name])
-                self.refiner_gate[dataset_name] = nn.Parameter(torch.zeros(self.output_dim[dataset_name]))
+                # gate_init 0 reproduces the un-refined model exactly at the fork step, but a zero gate also cuts the gradient
+                # into the branch for that variable (out = x + g * (W h + b): dL/dW[v] and dL/dh via v are both proportional to g_v,
+                # and dL/dg_v is the loss gradient projected on an UNTRAINED output), so a variable's gate only opens if a random
+                # output already helps: a deadlock seen in the first fork (only w opened). A small non-zero gate_init trains the
+                # branch for every variable from the start at the cost of a small initial perturbation.
+                gate_init = float(cfg.get("gate_init", 0.0))
+                self.refiner_gate[dataset_name] = nn.Parameter(torch.full((self.output_dim[dataset_name],), gate_init))
+                # out_init_scale < 1 shrinks the output projection (bias zeroed) so that a non-zero gate starts with a near-zero
+                # branch output: the gate's gradient (loss gradient projected on that output) has no consistent sign and the gate
+                # keeps its value, while W_out and the blocks train at full Adam speed for every variable. A gate of 0.1 with the
+                # default W_out gave a first-step loss of 12.6 vs 3.4 (white noise of ~0.1 * |W_out h| on every variable); a gate of
+                # 0.02 gave +1.0 and a consistent pull of the gate towards zero.
+                out_scale = float(cfg.get("out_init_scale", 1.0))
+                if out_scale != 1.0:
+                    with torch.no_grad():
+                        self.refiner_out[dataset_name].weight.mul_(out_scale)
+                        self.refiner_out[dataset_name].bias.zero_()
                 if self.refiner_use_data_latent:
                     self.refiner_latent_in[dataset_name] = nn.Linear(self.input_dim[dataset_name], channels)
 
@@ -170,7 +188,7 @@ class OptionalRefinerMixin:
             [str(k) for k in self.refiner_graph_provider.keys()],
             "off" if noise_cfg is None else dict(noise_cfg),
         )
-        LOGGER.info("refiner: data-latent input %s", "on" if self.refiner_use_data_latent else "off")
+        LOGGER.info("refiner: data-latent input %s, gate init %.3f, out init scale %.3g", "on" if self.refiner_use_data_latent else "off", float(cfg.get("gate_init", 0.0)), float(cfg.get("out_init_scale", 1.0)))
 
     def _apply_optional_refiner(
         self,
