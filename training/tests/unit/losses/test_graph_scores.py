@@ -1159,3 +1159,52 @@ def test_graph_score_uses_current_sharding_contract(
     assert result.ndim == 0
     assert all_to_all.call_count == 3
     assert loss.needs_shard_layout_info
+
+
+@pytest.mark.parametrize("ignore_nans", [False, True])
+@pytest.mark.parametrize("edge_chunks", [2, 3, 7])
+def test_graph_variogram_edge_chunks_match_unchunked(ignore_nans: bool, edge_chunks: int) -> None:
+    torch.manual_seed(0)
+    num_nodes, num_vars, members = 12, 3, 4
+    graph = HeteroData()
+    graph["data"].num_nodes = num_nodes
+    src = torch.arange(num_nodes).repeat_interleave(3)
+    dst = (src + torch.tensor([1, 2, 5]).repeat(num_nodes)) % num_nodes
+    graph["data", "to", "data"].edge_index = torch.stack([src, dst])
+    pred = torch.randn(1, 1, members, num_nodes, num_vars, dtype=torch.float64)
+    target = torch.randn(1, 1, 1, num_nodes, num_vars, dtype=torch.float64)
+    if ignore_nans:
+        target[..., 3, 1] = torch.nan
+        pred[:, :, 2, 7, 0] = torch.nan
+    kwargs = {
+        "loss_graph": {"edges_name": ["data", "to", "data"], "row_normalize": True},
+        "graph_data": graph,
+        "p": 0.5,
+        "fair": True,
+        "ignore_nans": ignore_nans,
+    }
+    reference = GraphVariogramScoreLoss(**kwargs)
+    chunked = GraphVariogramScoreLoss(**kwargs, edge_chunks=edge_chunks)
+    pred_ref = pred.clone().requires_grad_(True)
+    pred_chunk = pred.clone().requires_grad_(True)
+    out_ref = reference(pred_ref, target, squash=False)
+    out_chunk = chunked(pred_chunk, target, squash=False)
+    torch.testing.assert_close(out_chunk, out_ref, equal_nan=True)
+    torch.nansum(out_ref).backward()
+    torch.nansum(out_chunk).backward()
+    torch.testing.assert_close(pred_chunk.grad, pred_ref.grad, equal_nan=True)
+
+
+def test_graph_variogram_caches_edge_tensors() -> None:
+    graph = HeteroData()
+    graph["data"].num_nodes = 4
+    graph["data", "to", "data"].edge_index = torch.tensor([[0, 1, 2, 3], [1, 2, 3, 0]])
+    loss = GraphVariogramScoreLoss(
+        loss_graph={"edges_name": ["data", "to", "data"], "row_normalize": True}, graph_data=graph, edge_chunks=2,
+    )
+    pred = torch.randn(1, 1, 3, 4, 2, dtype=torch.float64)
+    target = torch.randn(1, 1, 1, 4, 2, dtype=torch.float64)
+    first = loss._graph_kernel_tensors(pred)
+    out1 = loss(pred, target)
+    assert all(a is b for a, b in zip(first, loss._graph_kernel_tensors(pred)))
+    torch.testing.assert_close(loss(pred, target), out1)
