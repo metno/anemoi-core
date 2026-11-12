@@ -378,6 +378,8 @@ class GraphVariogramScoreLossSchema(GraphScoreLossSchema):
     loss_graph: GraphScoreGraphSchema
     p: float = Field(default=1.0, gt=0.0)
     fair: bool = True
+    edge_chunks: int = Field(default=1, ge=1)
+    checkpoint_chunks: bool = True
 
 
 class GraphEdgeCRPSLossSchema(GraphScoreLossSchema):
