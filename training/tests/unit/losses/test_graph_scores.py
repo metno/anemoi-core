@@ -1208,3 +1208,49 @@ def test_graph_variogram_caches_edge_tensors() -> None:
     out1 = loss(pred, target)
     assert all(a is b for a, b in zip(first, loss._graph_kernel_tensors(pred)))
     torch.testing.assert_close(loss(pred, target), out1)
+
+
+@pytest.mark.parametrize("mode", ["dropped_graph", "outer_checkpoint"])
+def test_graph_variogram_checkpointed_chunks_release_dropped_graphs(mode: str) -> None:
+    """A checkpointed evaluation that is never backpropagated must not stay alive.
+
+    The ensemble training step wraps the loss in an outer non-reentrant checkpoint and recomputes it during backward;
+    the recomputed graph is dropped without a backward pass. If the chunk function references a tensor of that graph,
+    the checkpoint frames (and the prediction / target they hold) form a cycle through the autograd graph that the
+    garbage collector cannot break: a leak of one set of loss inputs per training step.
+    """
+    import gc
+
+    from torch.utils.checkpoint import _CheckpointFrame
+    from torch.utils.checkpoint import checkpoint
+
+    def live_frames() -> int:
+        gc.collect()
+        return sum(isinstance(obj, _CheckpointFrame) for obj in gc.get_objects())
+
+    torch.manual_seed(0)
+    num_nodes, num_vars, members = 12, 3, 2
+    graph = HeteroData()
+    graph["data"].num_nodes = num_nodes
+    src = torch.arange(num_nodes).repeat_interleave(3)
+    dst = (src + torch.tensor([1, 2, 5]).repeat(num_nodes)) % num_nodes
+    graph["data", "to", "data"].edge_index = torch.stack([src, dst])
+    loss = GraphVariogramScoreLoss(
+        loss_graph={"edges_name": ["data", "to", "data"], "row_normalize": True},
+        graph_data=graph,
+        edge_chunks=4,
+        checkpoint_chunks=True,
+    )
+    baseline = live_frames()
+    for _ in range(3):
+        weights = torch.randn(1, 1, members, num_nodes, num_vars, dtype=torch.float64, requires_grad=True)
+        target = torch.randn(1, 1, 1, num_nodes, num_vars, dtype=torch.float64)
+        if mode == "outer_checkpoint":
+            out = checkpoint(lambda w, t: loss(w * 1.0, t), weights, target, use_reentrant=False)
+            out.backward()
+            assert weights.grad is not None
+            assert torch.isfinite(weights.grad).all()
+        else:
+            out = loss(weights * 1.0, target)
+        del out, weights, target
+    assert live_frames() == baseline

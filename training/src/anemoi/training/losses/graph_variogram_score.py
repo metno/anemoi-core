@@ -161,11 +161,9 @@ class GraphVariogramScoreLoss(BaseGraphEdgeScoreLoss):
         # _aggregate_edge_values is applied once at the end, on the accumulated node sums).
         num_nodes = y_target.shape[-2]
         num_edges = source_index.shape[0]
-        node_values = torch.zeros(
-            (*y_target.shape[:-2], num_nodes, y_target.shape[-1]),
-            dtype=y_target.dtype,
-            device=y_target.device,
-        )
+        out_shape = (*y_target.shape[:-2], num_nodes, y_target.shape[-1])
+        out_dtype, out_device = y_target.dtype, y_target.device
+        node_values = torch.zeros(out_shape, dtype=out_dtype, device=out_device)
         weight_shape = (1,) * (y_target.ndim - 2) + (-1, 1)
         bounds = torch.linspace(0, num_edges, self.edge_chunks + 1, dtype=torch.int64).tolist()
 
@@ -180,7 +178,15 @@ class GraphVariogramScoreLoss(BaseGraphEdgeScoreLoss):
             score = self._edge_scores(y_pred_chunk, y_target_chunk, src, dst, valid)
             if valid is not None:
                 score = torch.where(valid, score, torch.zeros_like(score))
-            acc = torch.zeros_like(node_values)
+            # NB the closure must not reference ``node_values`` (or any other tensor of the autograd graph): the
+            # non-reentrant checkpoint keeps this function on its frame, the frame is referenced by the saved-tensor
+            # hooks of the graph, and ``node_values`` is rebound below to the accumulated result, i.e. to the graph
+            # itself. That reference cycle runs through C++ autograd nodes, so the garbage collector cannot break it;
+            # only a backward pass does (it releases the saved tensors). A graph that is built and then dropped
+            # without backward therefore kept the frame and the checkpoint inputs (prediction, target) alive for
+            # good. That happens every training step: the ensemble step wraps the loss in an outer non-reentrant
+            # checkpoint and recomputes it during backward, and the recomputed graph is never backpropagated.
+            acc = torch.zeros(out_shape, dtype=out_dtype, device=out_device)
             acc.index_add_(-2, dst, score * weights.to(dtype=score.dtype).view(weight_shape))
             return acc
 
