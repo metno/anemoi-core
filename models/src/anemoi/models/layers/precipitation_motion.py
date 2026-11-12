@@ -15,28 +15,40 @@ from torch import Tensor
 from torch import nn
 
 
-def _motion_pair(previous: np.ndarray, current: np.ndarray, cfg: dict) -> dict:
+def _motion_field(field: np.ndarray, cfg: dict) -> dict:
     factor = int(cfg.get("pooling_factor", 4))
-    height, width = previous.shape
-    images, rains, validity = [], [], []
-    for field in (previous, current):
-        padding = ((0, (-height) % factor), (0, (-width) % factor))
-        valid = np.pad(np.isfinite(field), padding, mode="edge")
-        rain = np.pad(np.maximum(np.nan_to_num(field, nan=0), 0), padding, mode="edge")
-        shape = (rain.shape[0] // factor, factor, rain.shape[1] // factor, factor)
-        scale = float(cfg.get("motion_log_scale_mm_h", .05))
-        image = np.log1p(rain / scale).reshape(shape).mean(axis=(1, 3))
-        image *= 255 / np.log1p(5 / scale)
-        image = ndimage.gaussian_filter(image.clip(0, 255), float(cfg.get("motion_image_sigma_coarse_cells", 1)))
-        images.append(image.astype(np.float32))
-        rains.append(rain.reshape(shape).mean(axis=(1, 3)))
-        validity.append(valid.reshape(shape).mean(axis=(1, 3)) >= .999)
+    height, width = field.shape
+    padding = ((0, (-height) % factor), (0, (-width) % factor))
+    valid = np.pad(np.isfinite(field), padding, mode="edge")
+    rain = np.pad(np.maximum(np.nan_to_num(field, nan=0), 0), padding, mode="edge")
+    shape = (rain.shape[0] // factor, factor, rain.shape[1] // factor, factor)
+    scale = float(cfg.get("motion_log_scale_mm_h", .05))
+    image = np.log1p(rain / scale).reshape(shape).mean(axis=(1, 3))
+    image *= 255 / np.log1p(5 / scale)
+    image = ndimage.gaussian_filter(image.clip(0, 255), float(cfg.get("motion_image_sigma_coarse_cells", 1)))
+    return {
+        "image": image.astype(np.float32),
+        "rain": rain.reshape(shape).mean(axis=(1, 3)),
+        "valid": valid.reshape(shape).mean(axis=(1, 3)) >= .999,
+        "pooling_factor": factor,
+        "native_shape": (height, width),
+    }
+
+
+def _motion_pair_from_fields(previous: dict, current: dict) -> dict:
+    factor = previous["pooling_factor"]
+    images = [previous["image"], current["image"]]
     forward = cv2.calcOpticalFlowFarneback(images[0], images[1], None, .5, 4, 21, 5, 5, 1.2, 0)
     gradient = np.maximum(np.hypot(ndimage.sobel(images[0], 0) / 8, ndimage.sobel(images[0], 1) / 8),
                           np.hypot(ndimage.sobel(images[1], 0) / 8, ndimage.sobel(images[1], 1) / 8))
-    return {"images": images, "rain": rains, "valid": validity[0] & validity[1],
+    return {"images": images, "rain": [previous["rain"], current["rain"]],
+        "valid": previous["valid"] & current["valid"],
         "forward": forward, "gradient": gradient, "pooling_factor": factor,
-        "native_shape": (height, width)}
+        "native_shape": previous["native_shape"]}
+
+
+def _motion_pair(previous: np.ndarray, current: np.ndarray, cfg: dict) -> dict:
+    return _motion_pair_from_fields(_motion_field(previous, cfg), _motion_field(current, cfg))
 
 
 def _local_velocity(pair: dict, cfg: dict) -> np.ndarray:
@@ -93,13 +105,12 @@ def _inverse_rigid_map(x: np.ndarray, y: np.ndarray, coefficients: np.ndarray,
 
 
 def _regional_forecast(fields: np.ndarray, initial: np.ndarray, cfg: dict) -> np.ndarray:
-    regional = []
-    previous = initial
-    for field in fields:
-        pair = _motion_pair(previous, field, cfg)
-        regional.append(_local_velocity(pair, cfg))
-        previous = field
-    return np.stack(regional)
+    prepared = [_motion_field(initial, cfg)]
+    prepared.extend(_motion_field(field, cfg) for field in fields)
+    return np.stack([
+        _local_velocity(_motion_pair_from_fields(previous, current), cfg)
+        for previous, current in zip(prepared[:-1], prepared[1:])
+    ])
 
 
 class PrecipitationMotionHead(nn.Module):
@@ -131,6 +142,7 @@ class PrecipitationMotionHead(nn.Module):
         self.radar_variable = radar_variable
         self.timestep_minutes = timestep_minutes
         self._grid = None
+        self._seam = None
         edges = graph[(hidden_dataset, "to", radar_dataset)].edge_index.detach().cpu().numpy()
         count = int(np.prod(self.grid_shape))
         degree = np.bincount(edges[1], minlength=count)
@@ -155,10 +167,63 @@ class PrecipitationMotionHead(nn.Module):
     def __getstate__(self):
         state = super().__getstate__()
         state["_grid"] = None
+        state["_seam"] = None
         return state
 
+    def prepare_grid(self) -> None:
+        """Build the immutable native remapping grid before threaded inference."""
+        if self._grid is None:
+            self._grid = np.mgrid[:self.grid_shape[0], :self.grid_shape[1]].astype(np.float32)
+        if getattr(self, "_seam", None) is None:
+            self._seam = self.seam_mask.detach().cpu().numpy()
+
+    def prepare_correction(self, radar_history: Tensor, reference_prediction: Tensor) -> dict:
+        """Prepare the correction state shared by every ensemble member."""
+        count = int(np.prod(self.grid_shape))
+        if radar_history.shape != (4, count):
+            raise ValueError("Precipitation motion requires four radar history frames")
+        reference = reference_prediction.detach().float().cpu().numpy().reshape(-1, *self.grid_shape)
+        if len(reference) < self.minimum_forecast_steps:
+            raise ValueError("Precipitation motion requires the member-zero forecast through three output steps")
+
+        cv2.setNumThreads(1)
+        history = radar_history.detach().float().cpu().numpy().reshape(4, *self.grid_shape)
+        cfg = self.settings
+        factor = cfg["pooling_factor"]
+        prepared_history = [_motion_field(field, cfg) for field in history]
+        past = [
+            _motion_pair_from_fields(previous, current)
+            for previous, current in zip(prepared_history[:-1], prepared_history[1:])
+        ]
+        historical = np.median(np.stack([_local_velocity(pair, cfg) for pair in past]), axis=0)
+        mask = past[-1]["valid"] & (np.minimum(*past[-1]["rain"]) >= cfg["motion_rain_minimum_mm_h"])
+        control = _regional_forecast(reference[:3], history[-1], cfg)
+        bias, centre = _fit_rigid_velocity(historical - np.median(control[:3], axis=0), mask, factor)
+        cy, cx = np.mgrid[:historical.shape[0], :historical.shape[1]].astype(np.float32)
+        self.prepare_grid()
+        return {
+            "history": history[-1],
+            "historical": historical,
+            "bias": bias,
+            "centre": centre,
+            "cy": cy,
+            "cx": cx,
+            "ny": self._grid[0],
+            "nx": self._grid[1],
+            "source_valid": np.isfinite(history[-1]).astype(np.float32),
+            "source": np.maximum(np.nan_to_num(history[-1], nan=0), 0),
+            "seam": self._seam,
+            "factor": factor,
+        }
+
     def forward(
-        self, prediction: Tensor, radar_history: Tensor, lead_minutes, *, reference_prediction: Tensor | None = None
+        self,
+        prediction: Tensor,
+        radar_history: Tensor,
+        lead_minutes,
+        *,
+        reference_prediction: Tensor | None = None,
+        prepared_correction: Mapping | None = None,
     ) -> Tensor:
         """Return CPU float32 ``[lead, member, node]`` without changing the inputs.
 
@@ -172,32 +237,29 @@ class PrecipitationMotionHead(nn.Module):
             raise ValueError("Precipitation motion requires consecutive positive forecast leads")
         cv2.setNumThreads(1)
         fields = prediction.detach().float().cpu().numpy()
-        history = radar_history.detach().float().cpu().numpy().reshape(4, *self.grid_shape)
-        reference = fields[:, 0] if reference_prediction is None else reference_prediction.detach().float().cpu().numpy()
-        reference = reference.reshape(-1, *self.grid_shape)
-        if len(reference) < self.minimum_forecast_steps:
-            raise ValueError("Precipitation motion requires the member-zero forecast through three output steps")
         cfg = self.settings
-        factor = cfg["pooling_factor"]
-        past = [_motion_pair(previous, current, cfg) for previous, current in zip(history[:-1], history[1:])]
-        historical = np.median(np.stack([_local_velocity(pair, cfg) for pair in past]), axis=0)
-        mask = past[-1]["valid"] & (np.minimum(*past[-1]["rain"]) >= cfg["motion_rain_minimum_mm_h"])
-        control = _regional_forecast(reference[:3], history[-1], cfg)
-        bias, centre = _fit_rigid_velocity(historical - np.median(control[:3], axis=0), mask, factor)
-        cy, cx = np.mgrid[:historical.shape[0], :historical.shape[1]].astype(np.float32)
-        if self._grid is None:
-            self._grid = np.mgrid[:self.grid_shape[0], :self.grid_shape[1]].astype(np.float32)
-        ny, nx = self._grid
-        source_valid = np.isfinite(history[-1]).astype(np.float32)
-        source = np.maximum(np.nan_to_num(history[-1], nan=0), 0)
-        seam = self.seam_mask.detach().cpu().numpy()
+        if prepared_correction is None:
+            reference = fields[:, 0] if reference_prediction is None else reference_prediction
+            if not isinstance(reference, Tensor):
+                reference = torch.from_numpy(reference)
+            prepared_correction = self.prepare_correction(radar_history, reference)
+        history = prepared_correction["history"]
+        historical = prepared_correction["historical"]
+        bias = prepared_correction["bias"]
+        centre = prepared_correction["centre"]
+        cy, cx = prepared_correction["cy"], prepared_correction["cx"]
+        ny, nx = prepared_correction["ny"], prepared_correction["nx"]
+        source_valid = prepared_correction["source_valid"]
+        source = prepared_correction["source"]
+        seam = prepared_correction["seam"]
+        factor = prepared_correction["factor"]
         result = np.empty_like(fields)
         for member in range(fields.shape[1]):
             original = fields[:, member].reshape(-1, *self.grid_shape)
-            regional = _regional_forecast(original, history[-1], cfg)
+            regional = _regional_forecast(original, history, cfg)
             model_backward = np.zeros_like(historical)
             for lead, image in enumerate(original):
-                median = ndimage.median_filter(np.nan_to_num(image, nan=0), size=cfg["cleanup_size"], mode="nearest")
+                median = cv2.medianBlur(np.ascontiguousarray(np.nan_to_num(image, nan=0)), cfg["cleanup_size"])
                 cleaned = np.maximum(np.where(seam & np.isfinite(image), median, image), 0)
                 mass = np.nansum(cleaned, dtype=np.float64)
                 if mass > 0:
