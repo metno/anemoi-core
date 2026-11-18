@@ -364,6 +364,8 @@ class EnsModelSchema(BaseModelSchema):
     "Noise injection configuration. Use NoOpNoiseInjector to disable, NoiseConditioning for conditioning, or NoiseInjector for direct injection."
     condition_on_residual: bool = Field(default=False)
     "Whether to condition the noise injection on the residual connection."
+    condition_on_prognostic_residual: bool = Field(default=False)
+    "Whether to append the previous prognostic state to the encoder input (input layout of the pre-0.12 ensemble model)."
 
 
 class TransportModelSchema(BaseModelSchema):

@@ -58,6 +58,7 @@ class GraphTransformerProcessorSchema(TransformerModelComponent):
             "graph_attention_backend": str,
             "edge_pre_mlp": bool,
             "gradient_checkpointing": bool,
+            "dropout_p": float,  # epistemic dropout (anemoi.models.layers.epistemic_dropout), default 0.0
         }
         extras = getattr(self, "__pydantic_extra__", {}) or {}
         for extra_field, value in extras.items():

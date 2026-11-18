@@ -17,7 +17,6 @@ import pytorch_lightning as pl
 import torch
 import torchinfo
 from pytorch_lightning.callbacks.model_checkpoint import ModelCheckpoint
-from pytorch_lightning.utilities import rank_zero_only
 from pytorch_lightning.utilities.types import STEP_OUTPUT
 
 from anemoi.training.utils.checkpoint import check_classes
@@ -52,14 +51,24 @@ class AnemoiCheckpoint(ModelCheckpoint):
         # of self._time_check_every_n_steps
         self._time_check_every_n_steps = 50
 
+        # Rank that writes this callback's checkpoints; None = global rank 0 (default). A strategy that trains several
+        # independent models in one job (e.g. co-training) sets one writer per model group.
+        self.ckpt_writer_rank: int | None = None
+
+    def _is_ckpt_writer(self, trainer: pl.Trainer) -> bool:
+        """Whether this rank writes the checkpoint files of this callback."""
+        if self.ckpt_writer_rank is None:
+            return trainer.is_global_zero
+        return trainer.global_rank == self.ckpt_writer_rank
+
     @staticmethod
     def _torch_drop_down(trainer: pl.Trainer) -> torch.nn.Module:
         # Get the model from the DataParallel wrapper, for single and multi-gpu cases
         assert hasattr(trainer, "model"), "Trainer has no attribute 'model'! Is the Pytorch Lightning version correct?"
         return trainer.model.module.model if hasattr(trainer.model, "module") else trainer.model.model
 
-    @rank_zero_only
     def model_metadata(self, model: torch.nn.Module) -> dict:
+        # called by the checkpoint writer only (see _save_checkpoint); formerly @rank_zero_only
         if self._model_metadata is not None:
             return self._model_metadata
 
@@ -171,7 +180,7 @@ class AnemoiCheckpoint(ModelCheckpoint):
             check_classes(model)
 
     def _save_checkpoint(self, trainer: pl.Trainer, lightning_checkpoint_filepath: str) -> None:
-        if trainer.is_global_zero:
+        if self._is_ckpt_writer(trainer):
             model = self._torch_drop_down(trainer)
 
             # We want a different uuid each time we save the model
@@ -224,7 +233,7 @@ class AnemoiCheckpoint(ModelCheckpoint):
         self._last_global_step_saved = trainer.global_step
         self._last_checkpoint_saved = lightning_checkpoint_filepath
 
-        if trainer.is_global_zero:
+        if self._is_ckpt_writer(trainer):
             from importlib.metadata import version
             from weakref import proxy
 

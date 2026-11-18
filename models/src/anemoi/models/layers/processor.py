@@ -22,6 +22,7 @@ from anemoi.models.distributed.graph import gather_tensor
 from anemoi.models.distributed.khop_edges import ensure_edges_are_dst_sorted
 from anemoi.models.distributed.khop_edges import shard_edges_1hop
 from anemoi.models.distributed.shapes import GraphShardInfo
+from anemoi.models.layers import epistemic_dropout as _epistemic_dropout
 from anemoi.models.layers.block import GraphConvProcessorBlock
 from anemoi.models.layers.block import GraphTransformerProcessorBlock
 from anemoi.models.layers.block import PointWiseMLPProcessorBlock
@@ -475,6 +476,7 @@ class GraphTransformerProcessor(BaseProcessor):
         shard_strategy: str = "edges",
         graph_attention_backend: str = "triton",
         edge_pre_mlp: bool = False,
+        dropout_p: float = 0.0,
         **kwargs,
     ) -> None:
         """Initialize GraphTransformerProcessor.
@@ -513,6 +515,9 @@ class GraphTransformerProcessor(BaseProcessor):
             Backend to use for graph transformer conv, options are "triton" and "pyg"
         edge_pre_mlp: bool, by default False
             Allow for edge feature mixing
+        dropout_p: float, by default 0.0
+            Epistemic dropout rate forwarded to every GraphTransformerProcessorBlock (0.0 = disabled;
+            see anemoi.models.layers.epistemic_dropout for the seeding contract)
         """
         super().__init__(
             num_channels=num_channels,
@@ -545,7 +550,10 @@ class GraphTransformerProcessor(BaseProcessor):
             graph_attention_backend=graph_attention_backend,
             edge_dim=edge_dim,
             edge_pre_mlp=edge_pre_mlp,
+            dropout_p=dropout_p,
         )
+        self.dropout_p = float(dropout_p)
+        _epistemic_dropout.attach(self)  # layer indices + one shared (step, rollout_step, armed) state for all blocks
 
         self.offload_layers(cpu_offload)
 

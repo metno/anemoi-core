@@ -1,5 +1,6 @@
 num_channels: 1024
 condition_on_residual: False
+condition_on_prognostic_residual: False # append the previous prognostic state to the encoder input (pre-0.12 ensemble model layout)
 cpu_offload: False
 
 keep_batch_sharded: True

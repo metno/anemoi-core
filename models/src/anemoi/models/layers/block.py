@@ -38,6 +38,7 @@ from anemoi.models.distributed.shapes import GraphShardInfo
 from anemoi.models.distributed.shapes import ShardSizes
 from anemoi.models.distributed.shapes import get_shard_sizes
 from anemoi.models.distributed.utils import model_is_distributed
+from anemoi.models.layers import epistemic_dropout as _epistemic_dropout
 from anemoi.models.layers.attention import MultiHeadCrossAttention
 from anemoi.models.layers.attention import MultiHeadSelfAttention
 from anemoi.models.layers.conv import GraphConv
@@ -1048,6 +1049,7 @@ class GraphTransformerProcessorBlock(GraphTransformerBaseBlock):
         shard_strategy: str = "edges",
         graph_attention_backend: str = "triton",
         edge_pre_mlp: bool = False,
+        dropout_p: float = 0.0,
         **kwargs,
     ) -> None:
         """Initialize GraphTransformerBlock.
@@ -1077,6 +1079,10 @@ class GraphTransformerProcessorBlock(GraphTransformerBaseBlock):
             Backend to use for graph transformer conv, options are "triton" and "pyg"
         edge_pre_mlp: bool, by default False
             Allow for edge feature mixing
+        dropout_p: float, by default 0.0
+            Epistemic dropout rate on the attention-output and MLP-output residual branches
+            (anemoi.models.layers.epistemic_dropout: one step-seeded mask shared across ensemble members;
+            0.0 = disabled, forward bitwise identical to a block without the feature)
         """
 
         super().__init__(
@@ -1096,6 +1102,7 @@ class GraphTransformerProcessorBlock(GraphTransformerBaseBlock):
         )
 
         self.shard_strategy = shard_strategy
+        self.dropout_p = float(dropout_p)  # epistemic dropout; state/layer index attached by the processor
         self._cached_halo_info = None
         self._cached_halo_cache_specs = None
         self._cached_partition = None
@@ -1267,7 +1274,14 @@ class GraphTransformerProcessorBlock(GraphTransformerBaseBlock):
         # out = self.projection(out + x_r) in chunks:
         out = torch.cat([self.projection(chunk) for chunk in torch.tensor_split(out + x_r, num_chunks, dim=0)], dim=0)
 
+        # epistemic dropout (WeatherNext 3 §2.2) on the two residual branches; no-op unless dropout_p > 0 AND the
+        # processor has armed it for this step (training mode or an explicit inference flag)
+        if getattr(self, "dropout_p", 0.0) > 0.0:
+            out = _epistemic_dropout.apply_site(self, out, _epistemic_dropout.SITE_ATTENTION, model_comm_group, batch_size)
         out = out + x_skip
-        nodes_new = self.run_node_dst_mlp(out, **cond_kwargs) + out
+        mlp_out = self.run_node_dst_mlp(out, **cond_kwargs)
+        if getattr(self, "dropout_p", 0.0) > 0.0:
+            mlp_out = _epistemic_dropout.apply_site(self, mlp_out, _epistemic_dropout.SITE_MLP, model_comm_group, batch_size)
+        nodes_new = mlp_out + out
 
         return nodes_new, edge_attr

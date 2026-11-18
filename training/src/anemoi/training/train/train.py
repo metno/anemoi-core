@@ -451,7 +451,11 @@ class AnemoiTrainer(ABC):
 
     def _get_checkpoint_directory(self, fork_id: str) -> Path:
         """Returns the directory where checkpoints are stored."""
-        return Path(self.config.system.output.checkpoints.root.parent, fork_id or self.lineage_run) / "last.ckpt"
+        lineage = Path(self.config.system.output.checkpoints.root.parent, fork_id or self.lineage_run)
+        # a strategy that trains several independent models in one job keeps each model's checkpoints in a
+        # subdirectory of the run's OWN lineage (resume only; a fork parent is always a plain run directory)
+        subdir = "" if fork_id else str(getattr(self.strategy, "checkpoint_subdir", "") or "")
+        return (lineage / subdir if subdir else lineage) / "last.ckpt"
 
     @cached_property
     def last_checkpoint(self) -> Path | None:
