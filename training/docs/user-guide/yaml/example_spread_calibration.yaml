@@ -1,0 +1,72 @@
+# Spread-calibration fine-tune of an existing ensemble model (rollout 4 as an example).
+# Only the blocks that differ from a plain rollout fine-tune are shown.
+training:
+  method:
+    _target_: anemoi.training.spread.target_noise.TargetNoiseEnsembleTraining
+  target_noise:
+    enabled: True
+    smoother: /path/to/smoothers/gauss_8x.npz          # colours the noise (unit variance at every node)
+    amplitude_table:                                   # one table per rollout step; the last is reused beyond
+      - /path/to/tables/target_noise_step1.json
+      - /path/to/tables/target_noise_step2.json
+      - /path/to/tables/target_noise_step3.json
+      - /path/to/tables/target_noise_step4.json
+    amplitude_fraction: 1.0
+    dose_map: /path/to/tables/dose_map.npz             # optional spatial redistribution, area mean of w^2 = 1
+    include_variables: [z_500, z_850, msl, sp]         # perturb only these (or exclude_variables)
+    anneal_steps: null
+    seed: 42
+  training_loss:
+    datasets:
+      data:
+        _target_: anemoi.training.spread.TrainingDiagnosticsLossWrapper   # train-side spread and skill, per band
+        diagnostics_scalers: ['node_weights']
+        loss:
+          _target_: anemoi.training.spread.MultiscaleSpreadLossWrapper
+          multiscale_config:
+            loss_matrices_path: /path/to/smoothers
+            loss_matrices: [gauss_8x.npz, gauss_2x.npz, null]             # coarsest first; null = full resolution
+          weights: [1.0, 1.0, 1.0]
+          per_scale_spread_adjustment: [1.0, 1.0, 1.0]                    # the controller multiplies on top
+          per_scale_loss:
+            _target_: anemoi.training.spread.SpreadScaledCRPS
+            alpha: 0.95
+            backend: stable
+            spread_adjustment: 1.0
+            per_variable_spread_adjustment: {tp: 1.0, tcc: 1.0}           # bounded variables: pinned, never controlled
+            scalers: ['pressure_level', 'general_variable', 'nan_mask_weights', 'node_weights', 'time_steps']
+            ignore_nans: False
+            no_autocast: True
+  validation_metrics:
+    datasets:
+      data:
+        ensvar:
+          _target_: anemoi.training.spread.EnsembleVariance
+          scalers: ['node_weights', 'time_steps']
+        ensmse:
+          _target_: anemoi.training.spread.EnsembleMeanSquaredError
+          scalers: ['node_weights', 'time_steps']
+
+diagnostics:
+  callbacks:
+    - _target_: anemoi.training.spread.callbacks.SpreadSkillLogger
+      variables: ${training.metrics.datasets.data}
+      log_all: True
+      dump_path: ${system.output.root}/logs/spread_skill_epochs.jsonl
+    - _target_: anemoi.training.spread.callbacks.CombinedAdaptiveSpreadController
+      update_interval: 250
+      kappa: 0.3
+      max_update_frac: 0.015
+      table_clamp:                     # (lo, hi) per band, coarsest first
+        - [0.8, 2.0]
+        - [0.9, 1.6]
+        - [0.9, 1.1]
+      rollout_clamp:                   # per-step factors; <= 1 at coarse and mid scales guards long leads
+        - [0.9, 1.0]
+        - [0.9, 1.0]
+        - [0.9, 1.2]
+      ema_horizon: 250
+      warmup_steps: 500
+      min_ssr: 0.3
+      freeze_steps: 1000
+      dump_path: ${system.output.root}/logs/adaptive_controller.jsonl

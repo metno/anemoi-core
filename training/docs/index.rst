@@ -41,6 +41,7 @@ This package provides the *Anemoi* training functionality.
    user-guide/evaluation
    user-guide/tasks
    user-guide/training-methods
+   user-guide/spread-calibration
    user-guide/models
    user-guide/tracking
    user-guide/benchmarking

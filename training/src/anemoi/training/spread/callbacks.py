@@ -496,7 +496,7 @@ class CombinedAdaptiveSpreadController(Callback):
         ssr_target: float | Sequence[float] = 1.0,
     ) -> None:
         super().__init__()
-        self.enabled = bool(enabled)  # master switch (False -> fully inert; smoke bisection)
+        self.enabled = bool(enabled)  # master switch (False -> fully inert)
         # the SSR the controller drives towards, one value or one per 0-based rollout
         # step (clamp-to-last; e.g. [1.0, 1.0, 1.0, 1.03] = 24 h target 1.03). 1.0 = the default law.
         self.ssr_target: list[float] = [float(x) for x in ssr_target] if isinstance(ssr_target, (list, tuple)) else [float(ssr_target)]

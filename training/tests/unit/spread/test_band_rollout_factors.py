@@ -14,7 +14,7 @@
 - per-rollout-step factor applied via the forwarded ``rollout_step``.
 
 Toy geometry from conftest (1-D periodic ring, two moving-average smoothers, file mode);
-login-node friendly (CPU, seconds).
+CPU only, seconds.
 """
 
 from __future__ import annotations

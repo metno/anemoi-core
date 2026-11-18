@@ -307,7 +307,7 @@ def build_target_noise(
 
 
 def load_dose_map(source: str | Path | Mapping[str, Any], *, name_to_index: Mapping[str, int], active_names: list[str], n_full: int) -> torch.Tensor:
-    """``(n_grid, n_full)`` dose map from a ``jobs/dose_map.py`` .npz (``names`` (nvar), ``w`` (nvar, n_grid), ``lat``) or an
+    """``(n_grid, n_full)`` dose map from an .npz with ``names`` (nvar), ``w`` (nvar, n_grid) and optionally ``lat`` (degrees), or an
     in-memory mapping ``{"names": [...], "w": array, "lat": array}``; every perturbed variable must have a map (KeyError
     otherwise), inactive channels get 1.  Logs the area-weighted mean of ``w²`` per variable (should be 1 ± 2 %)."""
     z = dict(source) if isinstance(source, Mapping) else dict(np.load(source, allow_pickle=False))
