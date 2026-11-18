@@ -76,7 +76,8 @@ class AnemoiEnsModelEncProcDec(AnemoiModelEncProcDec):
     def _calculate_input_dim(self, dataset_name: str) -> int:
         base_input_dim = super()._calculate_input_dim(dataset_name)
         base_input_dim += 1  # for forecast step (fcstep)
-        if self.condition_on_residual or self.condition_on_prognostic_residual:
+        # getattr: a model unpickled from a checkpoint written before this flag existed never ran this __init__
+        if self.condition_on_residual or getattr(self, "condition_on_prognostic_residual", False):
             base_input_dim += self.num_input_channels_prognostic[dataset_name]
         return base_input_dim
 
@@ -122,7 +123,7 @@ class AnemoiEnsModelEncProcDec(AnemoiModelEncProcDec):
                 ),
                 dim=-1,
             )
-        elif self.condition_on_prognostic_residual:
+        elif getattr(self, "condition_on_prognostic_residual", False):  # see _calculate_input_dim
             # x_skip is (batch, [time,] ensemble, grid, vars) over all input variables; take the
             # prognostic ones at the last input step, as the pre-0.12 ensemble model did.
             x_skip_prog = x_skip[:, 0] if x_skip.ndim == 5 else x_skip
