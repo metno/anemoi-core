@@ -439,6 +439,547 @@ class SpreadSkillLogger(Callback):
         self._dump_epoch(trainer, pl_module, "val")
 
 
+class CombinedAdaptiveSpreadController(Callback):
+    """Adaptive controller of the spread factors of a multiscale spread loss.
+
+    Drives val SSR → 1 per (variable × band × rollout step) by feedback on the widening tensor of a
+    :class:`MultiscaleSpreadLossWrapper`:
+
+    * **Signal**: live *train*-side per-(v, b, r) ⟨s²⟩ / ⟨(x̄−y)²⟩ from the
+      band diagnostics, smoothed by per-batch EMAs, corrected by the last-known val/train SSR
+      ratio per (v, b, r) — the ratio refreshes at every true validation and is logged/dumped
+      (it is the live ``g`` estimate).
+    * **Structure**: full per-(variable, band) table shared across rollout steps, times a
+      per-(band, rollout-step) factor ``a_{b,r}``;
+      ``a_{b,0} ≡ 1`` (identifiability — the table owns the first lead). Variables with static leaf overrides (bounded pins) are never controlled.
+    * **Update** every ``update_interval`` global steps: multiplicative
+      ``a ← a · (1/SSR_corr)^κ`` with the per-update change clamped to ``±max_update_frac``;
+      table entries driven by ``SSR_corr(v, b, r=0)`` and clamped to ``table_clamp`` — either one
+      global ``(lo, hi)`` or one pair per band; ``a_{b,r}`` (r ≥ 1)
+      driven by the **median** over v of ``SSR_corr(·, b, r)`` (the median, so that a few variables do not dominate) and clamped to ``rollout_clamp`` — one global ``(lo, hi)`` or one pair per band
+      (clamping the coarse/mid ``a_{b,r}`` at 1.0 guards against a spread runaway at long leads).
+    * **Seeding**: ``seed_dump_path`` initialises the table and ``a_{b,r}`` from the last
+      record of a previous run's controller dump . A flat legacy ``a_r`` record is broadcast across bands;
+      ``seed_extend_rollout`` extends each band row to the new rollout depth by repeating the last
+      value. Seeded values are clamped into the (possibly new) band
+      clamps and the number of clipped entries is logged. A checkpoint resume wins over the seed.
+    * **Warmup/phases**: no updates before ``warmup_steps`` and until the median corrected
+      SSR at r = 0 exceeds ``min_ssr``; when the number of rollout steps changes mid-run (rollout
+      phase start), updates freeze for ``freeze_steps`` and the transition is logged with a table
+      snapshot.
+    * EMAs of ⟨s²⟩ and ⟨(x̄−y)²⟩ are kept separately (ratio of smoothed quantities) and
+      all-reduced across ranks at update/validation time, so every rank applies identical factors
+      (the widening is part of the loss — ranks must not diverge).
+
+    State (table, ``a_{b,r}``, EMAs, ratios, counters) is checkpointed with the callback.
+    """
+
+    def __init__(
+        self,
+        *,
+        enabled: bool = True,
+        update_interval: int = 250,
+        kappa: float = 0.3,
+        max_update_frac: float = 0.015,
+        table_clamp: Sequence[float] | Sequence[Sequence[float]] = (0.9, 1.3),
+        rollout_clamp: tuple[float, float] = (0.9, 1.2),
+        ema_horizon: int = 250,
+        warmup_steps: int = 500,
+        min_ssr: float = 0.3,
+        freeze_steps: int = 1000,
+        dataset_name: str = "data",
+        ensvar_name: str = "ensvar",
+        ensmse_name: str = "ensmse",
+        dump_path: str | None = None,
+        seed_dump_path: str | None = None,
+        seed_extend_rollout: int | None = None,
+        ssr_target: float | Sequence[float] = 1.0,
+    ) -> None:
+        super().__init__()
+        self.enabled = bool(enabled)  # master switch (False -> fully inert; smoke bisection)
+        # the SSR the controller drives towards, one value or one per 0-based rollout
+        # step (clamp-to-last; e.g. [1.0, 1.0, 1.0, 1.03] = 24 h target 1.03). 1.0 = the default law.
+        self.ssr_target: list[float] = [float(x) for x in ssr_target] if isinstance(ssr_target, (list, tuple)) else [float(ssr_target)]
+        if not self.ssr_target or any(not (x > 0) for x in self.ssr_target):
+            msg = f"ssr_target must be positive (one value or one per rollout step), got {ssr_target!r}"
+            raise ValueError(msg)
+        self.update_interval = max(1, int(update_interval))
+        self.kappa = float(kappa)
+        self.max_update_frac = float(max_update_frac)
+        # global (lo, hi) or one (lo, hi) per band; normalised to per-band in on_train_start
+        clamp = list(table_clamp)
+        if isinstance(clamp[0], (int, float)):
+            self.table_clamp: list[tuple[float, float]] | tuple[float, float] = (float(clamp[0]), float(clamp[1]))
+        else:
+            self.table_clamp = [(float(lo), float(hi)) for lo, hi in clamp]
+        rclamp = list(rollout_clamp)
+        if isinstance(rclamp[0], (int, float)):
+            self.rollout_clamp: list[tuple[float, float]] | tuple[float, float] = (float(rclamp[0]), float(rclamp[1]))
+        else:  # one (lo, hi) per band
+            self.rollout_clamp = [(float(lo), float(hi)) for lo, hi in rclamp]
+        self.ema_alpha = math.exp(-1.0 / max(1, int(ema_horizon)))
+        self.warmup_steps = int(warmup_steps)
+        self.min_ssr = float(min_ssr)
+        self.freeze_steps = int(freeze_steps)
+        self.dataset_name = dataset_name
+        self.ensvar_name = ensvar_name
+        self.ensmse_name = ensmse_name
+        self.dump_path = str(dump_path) if dump_path else None
+        self.seed_dump_path = str(seed_dump_path) if seed_dump_path else None
+        self.seed_extend_rollout = int(seed_extend_rollout) if seed_extend_rollout else None
+
+        # live state (initialised on_train_start / grown on first sight of a (b, r) slot)
+        self.names: list[str] = []
+        self.controlled: torch.Tensor | None = None  # (v,) bool — False for pinned variables
+        self.table: torch.Tensor | None = None  # (v, B)
+        self.a_br: list[list[float]] = []  # [band][r-1] (a_{b,0} fixed at 1.0)
+        self._clamp_lo: torch.Tensor | None = None  # (1, B) — built in on_train_start
+        self._clamp_hi: torch.Tensor | None = None
+        self._ema_var: dict[tuple[int, int], torch.Tensor] = {}  # (b, r) -> (v,)
+        self._ema_mse: dict[tuple[int, int], torch.Tensor] = {}
+        self._ratio: dict[tuple[int, int], torch.Tensor] = {}  # val/train SSR ratio (live g)
+        self._val_var: dict[tuple[int, int], torch.Tensor] = {}
+        self._val_mse: dict[tuple[int, int], torch.Tensor] = {}
+        self._val_count = 0
+        self._pending_val: tuple[dict, dict] | None = None  # stashed val sums awaiting the next update
+        self._last_update_step = -1
+        self._freeze_until = -1
+        self._last_n_steps: int | None = None
+        self._last_factor_sign: torch.Tensor | None = None
+        self._sign_flips = 0
+        self._n_updates = 0
+        self._pending_state: dict[str, Any] | None = None
+        self._num_bands = 0
+
+    # ------------------------------------------------------------------ wiring
+    def _wrapper(self, pl_module: pl.LightningModule) -> MultiscaleSpreadLossWrapper | None:
+        wrappers = _multiscale_spread_wrappers(pl_module)
+        return wrappers[0] if wrappers else None
+
+    def on_train_start(self, trainer: pl.Trainer, pl_module: pl.LightningModule) -> None:  # noqa: ARG002
+        if not self.enabled:
+            LOGGER.info("CombinedAdaptiveSpreadController: enabled=False; inert.")
+            return
+        wrapper = self._wrapper(pl_module)
+        if wrapper is None:
+            LOGGER.warning("CombinedAdaptiveSpreadController: no MultiscaleSpreadLossWrapper; inactive.")
+            return
+        leaf = wrapper._spread_leaves[0]
+        index = leaf.variable_index
+        if index is None:
+            LOGGER.warning(
+                "CombinedAdaptiveSpreadController: leaf variable names unresolved; inactive.",
+            )
+            return
+        self.names = [name for name, _ in sorted(index.items(), key=lambda kv: kv[1])]
+        pinned = set(wrapper.static_variable_overrides)
+        self.controlled = torch.tensor([name not in pinned for name in self.names])
+        self._num_bands = wrapper.num_scales
+
+        # normalise the clamp config to per-band (1, B) bound tensors
+        clamp = self.table_clamp
+        if isinstance(clamp, tuple):
+            clamp = [clamp] * self._num_bands
+        if len(clamp) != self._num_bands:
+            msg = f"table_clamp has {len(clamp)} band pairs, expected {self._num_bands}"
+            raise ValueError(msg)
+        if isinstance(self.rollout_clamp, list) and len(self.rollout_clamp) != self._num_bands:
+            msg = f"rollout_clamp has {len(self.rollout_clamp)} band pairs, expected {self._num_bands}"
+            raise ValueError(msg)
+        self._clamp_lo = torch.tensor([lo for lo, _ in clamp], dtype=torch.float64).unsqueeze(0)
+        self._clamp_hi = torch.tensor([hi for _, hi in clamp], dtype=torch.float64).unsqueeze(0)
+
+        if self._pending_state is not None:
+            self._load_live_state(self._pending_state)
+            self._pending_state = None
+        if self.table is None and self.seed_dump_path:
+            self._load_seed()
+        if self.table is None:
+            configured = wrapper.get_per_variable_band_table()
+            self.table = torch.ones(len(self.names), self._num_bands, dtype=torch.float64)
+            for name, values in configured.items():
+                if name in index:
+                    self.table[self.names.index(name)] = torch.tensor(values, dtype=torch.float64)
+        if not self.a_br:
+            self.a_br = [[] for _ in range(self._num_bands)]
+        self._apply(wrapper)
+        LOGGER.info(
+            "CombinedAdaptiveSpreadController active: %d variables (%d controlled), %d bands, "
+            "update every %d steps, kappa=%.2f, clamps table=%s rollout=%s, warmup=%d, min_ssr=%.2f",
+            len(self.names),
+            int(self.controlled.sum()),
+            self._num_bands,
+            self.update_interval,
+            self.kappa,
+            self.table_clamp,
+            self.rollout_clamp,
+            self.warmup_steps,
+            self.min_ssr,
+        )
+
+    def _load_seed(self) -> None:
+        """Initialise table and ``a_{b,r}`` from the last record of a previous run's dump."""
+        lines = Path(self.seed_dump_path).read_text().strip().splitlines()
+        rec = json.loads(lines[-1])
+        self.table = torch.ones(len(self.names), self._num_bands, dtype=torch.float64)
+        matched = 0
+        for name, values in rec.get("table", {}).items():
+            if name in self.names:
+                self.table[self.names.index(name)] = torch.tensor(values, dtype=torch.float64)
+                matched += 1
+        raw = self.table.clone()
+        self.table = torch.maximum(torch.minimum(self.table, self._clamp_hi), self._clamp_lo)
+        clipped = int((self.table != raw).sum())
+        a_br = rec.get("a_br")
+        if a_br is None and rec.get("a_r"):  # legacy shared a_r -> broadcast across bands
+            a_br = [list(rec["a_r"])] * self._num_bands
+        self.a_br = [[float(v) for v in row] for row in (a_br or [[] for _ in range(self._num_bands)])]
+        if self.seed_extend_rollout:  # extend to the new rollout depth by repeating the last value
+            target = self.seed_extend_rollout - 1
+            for row in self.a_br:
+                while row and len(row) < target:
+                    row.append(row[-1])
+        self.a_br = [
+            [min(max(v, self._rollout_bounds(b)[0]), self._rollout_bounds(b)[1]) for v in row] for b, row in enumerate(self.a_br)
+        ]
+        LOGGER.info(
+            "CombinedAdaptiveSpreadController: seeded from %s @ step %s (%d/%d table rows matched, "
+            "%d entries clipped into the band clamps), a_br = %s",
+            self.seed_dump_path,
+            rec.get("global_step"),
+            matched,
+            int(self.controlled.sum()),
+            clipped,
+            [[round(v, 4) for v in row] for row in self.a_br],
+        )
+
+    def _apply(self, wrapper: MultiscaleSpreadLossWrapper) -> None:
+        """Push the controller state into the wrapper (controlled variables only)."""
+        table = {
+            name: [float(v) for v in self.table[i]]
+            for i, name in enumerate(self.names)
+            if bool(self.controlled[i])
+        }
+        wrapper.set_per_variable_band_table(table)
+        if any(self.a_br):
+            depth = max(len(row) for row in self.a_br)
+            rows = [[1.0, *row, *([row[-1]] * (depth - len(row)))] if row else [1.0] * (depth + 1) for row in self.a_br]
+            wrapper.set_per_rollout_step_adjustment(rows)
+        else:
+            wrapper.set_per_rollout_step_adjustment(None)
+
+    # ------------------------------------------------------------------ signal accumulation
+    def _rollout_bounds(self, band: int) -> tuple[float, float]:
+        """``(lo, hi)`` of ``a_{b,r}`` for ``band``: the global pair, or the band's own pair."""
+        if isinstance(self.rollout_clamp, tuple):
+            return self.rollout_clamp
+        return self.rollout_clamp[band]
+
+    def _band_vectors(self, values: dict[str, Any]) -> dict[int, tuple[torch.Tensor, torch.Tensor]]:
+        # kept on the metrics' device: the NCCL all-reduce at update time needs CUDA tensors
+        out = {}
+        for b in range(self._num_bands):
+            var = values.get(f"{self.ensvar_name}_band{b}")
+            mse = values.get(f"{self.ensmse_name}_band{b}")
+            if var is not None and mse is not None:
+                out[b] = (var.detach().double(), mse.detach().double())
+        return out
+
+    def on_train_batch_end(self, trainer: pl.Trainer, pl_module: pl.LightningModule, outputs: Any, batch: Any, batch_idx: int) -> None:  # noqa: ARG002
+        if self.table is None:
+            return
+        wrapper = self._wrapper(pl_module)
+        wrappers = _diagnostic_wrappers(pl_module)
+        if wrapper is None or self.dataset_name not in wrappers:
+            return
+        n_steps = _n_task_steps(pl_module, "training")
+        if n_steps is not None and self._last_n_steps is not None and n_steps != self._last_n_steps:
+            self._freeze_until = int(getattr(trainer, "global_step", 0)) + self.freeze_steps
+            LOGGER.info(
+                "CombinedAdaptiveSpreadController: rollout steps %d -> %d at step %d; updates frozen "
+                "for %d steps. table min/mean/max = %.4f/%.4f/%.4f, a_br = %s",
+                self._last_n_steps,
+                n_steps,
+                int(getattr(trainer, "global_step", 0)),
+                self.freeze_steps,
+                float(self.table.min()),
+                float(self.table.mean()),
+                float(self.table.max()),
+                [[round(v, 4) for v in row] for row in self.a_br],
+            )
+        self._last_n_steps = n_steps
+
+        for order, values in enumerate(_peek_forward_entries(wrappers[self.dataset_name], n_steps), start=1):
+            step, _tensors = _entry_step_and_tensors(order, values)
+            r = step - 1
+            for b, (var, mse) in self._band_vectors(values).items():
+                key = (b, r)
+                if key not in self._ema_var:
+                    self._ema_var[key] = var.clone()
+                    self._ema_mse[key] = mse.clone()
+                else:
+                    a = self.ema_alpha
+                    # a checkpoint-resumed EMA may live on CPU — rehome it to the incoming device
+                    if self._ema_var[key].device != var.device:
+                        self._ema_var[key] = self._ema_var[key].to(var.device)
+                        self._ema_mse[key] = self._ema_mse[key].to(var.device)
+                    self._ema_var[key].mul_(a).add_(var, alpha=1.0 - a)
+                    self._ema_mse[key].mul_(a).add_(mse, alpha=1.0 - a)
+            for row in self.a_br:
+                if r > len(row):
+                    row.extend([1.0] * (r - len(row)))
+
+        global_step = int(getattr(trainer, "global_step", 0))
+        if (
+            global_step >= self.warmup_steps
+            and global_step >= self._freeze_until
+            and global_step - self._last_update_step >= self.update_interval
+            and self._ema_var
+        ):
+            self._update(trainer, pl_module, wrapper, global_step)
+
+    # ------------------------------------------------------------------ the update
+    def _corrected_ssr(self, key: tuple[int, int], ens_size: int) -> torch.Tensor | None:
+        var = self._ema_var.get(key)
+        mse = self._ema_mse.get(key)
+        if var is None or mse is None:
+            return None
+        var = _all_reduce_sum_(var.clone())
+        mse = _all_reduce_sum_(mse.clone())
+        # summing var and mse over ranks leaves their ratio ≈ the rank-mean ratio (R cancels)
+        ssr = ((ens_size + 1) / ens_size * var / mse.clamp(min=1e-30)) ** 0.5
+        ssr[mse <= 0] = float("nan")
+        ssr = ssr.cpu()
+        ratio = self._ratio.get(key)
+        if ratio is not None:
+            ssr = ssr * ratio
+        return ssr
+
+    def _target(self, step: int) -> float:
+        """SSR target of 0-based rollout step ``step`` (clamp-to-last; 1.0 unless ``ssr_target`` is set)."""
+        return self.ssr_target[min(int(step), len(self.ssr_target) - 1)]
+
+    def _update(self, trainer: pl.Trainer, pl_module: pl.LightningModule, wrapper: MultiscaleSpreadLossWrapper, global_step: int) -> None:
+        ens_size = _ens_size(pl_module)
+        if ens_size is None:
+            return
+        LOGGER.debug("CombinedAdaptiveSpreadController: update reduce start (step %d)", global_step)
+        self._refresh_ratio(ens_size)  # folds any stashed validation sums into the ratios first
+        ssr0 = [self._corrected_ssr((b, 0), ens_size) for b in range(self._num_bands)]
+        if any(s is None for s in ssr0):
+            return
+        ssr0 = torch.stack(ssr0, dim=1)  # (v, B)
+        med0 = float(torch.nanmedian(ssr0))
+        if not math.isfinite(med0) or med0 <= self.min_ssr:
+            LOGGER.info(
+                "CombinedAdaptiveSpreadController: median corrected SSR %.3f <= min_ssr %.2f at step %d; holding.",
+                med0,
+                self.min_ssr,
+                global_step,
+            )
+            self._last_update_step = global_step
+            return
+
+        lo, hi = 1.0 - self.max_update_frac, 1.0 + self.max_update_frac
+        factor = (self._target(0) / ssr0.clamp(min=1e-6)) ** self.kappa
+        factor = factor.clamp(min=lo, max=hi)
+        factor[~torch.isfinite(ssr0)] = 1.0
+        factor[~self.controlled] = 1.0
+        self.table = torch.maximum(torch.minimum(self.table * factor, self._clamp_hi), self._clamp_lo)
+
+        sign = torch.sign(torch.log(factor))
+        if self._last_factor_sign is not None and self._last_factor_sign.shape == sign.shape:
+            self._sign_flips = int(((sign * self._last_factor_sign) < 0).sum())
+        self._last_factor_sign = sign
+
+        # a_{b,r} (r >= 1): each band row driven by the median over v of its own band's SSR
+        r_factors: list[list[float]] = [[] for _ in range(self._num_bands)]
+        depth = max((len(row) for row in self.a_br), default=0)
+        ssr_cache: dict[tuple[int, int], torch.Tensor | None] = {}
+        for r in range(1, depth + 1):
+            for b in range(self._num_bands):
+                ssr_cache[(b, r)] = self._corrected_ssr((b, r), ens_size)
+        for b, row in enumerate(self.a_br):
+            for r in range(1, len(row) + 1):
+                ssr_r = ssr_cache.get((b, r))
+                if ssr_r is None:
+                    r_factors[b].append(1.0)
+                    continue
+                med = float(torch.nanmedian(ssr_r))
+                if not math.isfinite(med) or med <= 0:
+                    r_factors[b].append(1.0)
+                    continue
+                f = min(max((self._target(r) / med) ** self.kappa, lo), hi)
+                rlo, rhi = self._rollout_bounds(b)
+                row[r - 1] = min(max(row[r - 1] * f, rlo), rhi)
+                r_factors[b].append(f)
+
+        self._apply(wrapper)
+        self._last_update_step = global_step
+        self._n_updates += 1
+
+        log = getattr(pl_module, "log", None)
+        if callable(log):
+            log("adaptive/ssr_corr_med_r0", med0, on_step=True, on_epoch=False, logger=getattr(pl_module, "logger_enabled", True), rank_zero_only=True)
+            log("adaptive/table_mean", float(self.table[self.controlled].mean()), on_step=True, on_epoch=False, logger=getattr(pl_module, "logger_enabled", True), rank_zero_only=True)
+            log("adaptive/table_max", float(self.table[self.controlled].max()), on_step=True, on_epoch=False, logger=getattr(pl_module, "logger_enabled", True), rank_zero_only=True)
+            log("adaptive/sign_flips", float(self._sign_flips), on_step=True, on_epoch=False, logger=getattr(pl_module, "logger_enabled", True), rank_zero_only=True)
+            for b, row in enumerate(self.a_br):
+                for r, v in enumerate(row, start=1):
+                    log(f"adaptive/a_b{b}r{r}", v, on_step=True, on_epoch=False, logger=getattr(pl_module, "logger_enabled", True), rank_zero_only=True)
+            r0 = self._ratio.get((0, 0))
+            if r0 is not None:  # the live g estimate (val/train SSR, band 0, training lead)
+                log("adaptive/val_train_ratio_med_b0r0", float(r0.median()), on_step=True, on_epoch=False, logger=getattr(pl_module, "logger_enabled", True), rank_zero_only=True)
+        self._dump(trainer, global_step, med0, r_factors)
+
+    # ------------------------------------------------------------------ validation ratio (the live g)
+    def on_validation_batch_end(self, trainer: pl.Trainer, pl_module: pl.LightningModule, outputs: Any, batch: Any, batch_idx: int, dataloader_idx: int = 0) -> None:  # noqa: ARG002
+        if self.table is None or getattr(trainer, "sanity_checking", False):
+            return
+        wrappers = _diagnostic_wrappers(pl_module)
+        if self.dataset_name not in wrappers:
+            return
+        n_steps = _n_task_steps(pl_module, "validation")
+        for order, values in enumerate(_peek_forward_entries(wrappers[self.dataset_name], n_steps), start=1):
+            step, _tensors = _entry_step_and_tensors(order, values)
+            r = step - 1
+            for b, (var, mse) in self._band_vectors(values).items():
+                key = (b, r)
+                if key not in self._val_var:
+                    self._val_var[key] = var.clone()
+                    self._val_mse[key] = mse.clone()
+                else:
+                    self._val_var[key] += var.to(self._val_var[key].device)
+                    self._val_mse[key] += mse.to(self._val_mse[key].device)
+        self._val_count += 1
+
+    def on_validation_epoch_end(self, trainer: pl.Trainer, pl_module: pl.LightningModule) -> None:
+        """Stash the epoch's val sums; NO collectives here.
+
+        The ratio is computed inside the next training-side ``_update`` (a proven-working
+        collective site). Running all-reduces from this hook deadlocks on NCCL — the training-loss collectives interleave with
+        Lightning's own epoch-end reductions here. The ~one-update-interval lag this adds to the
+        ratio's train-side denominator is well within the EMA horizon.
+        """
+        if self.table is None or getattr(trainer, "sanity_checking", False) or not self._val_var:
+            self._val_var, self._val_mse, self._val_count = {}, {}, 0
+            return
+        self._pending_val = ({k: t.clone() for k, t in self._val_var.items()},
+                             {k: t.clone() for k, t in self._val_mse.items()})
+        self._val_var, self._val_mse, self._val_count = {}, {}, 0
+        LOGGER.info(
+            "CombinedAdaptiveSpreadController: val sums stashed (%d keys); ratio refresh at next update",
+            len(self._pending_val[0]),
+        )
+
+    def _refresh_ratio(self, ens_size: int) -> None:
+        """Fold the stashed validation sums into val/train SSR ratios (collectives; update-time only).
+
+        RANK-SYMMETRIC BY CONSTRUCTION (the 2026-08-25 deadlock, job 54148969/54153752, was a rank
+        whose local val sums came up empty skipping the loop while the others entered it): every
+        rank always executes the same collective sequence — one flag all-reduce, then, if ANY rank
+        stashed validation sums, one pass over the STRUCTURAL key set (the train-EMA keys, identical
+        on all ranks), zero-filling keys a rank has no local data for (zeros are the correct
+        contribution to a sum; the reduced totals cover exactly the ranks that saw data).
+        """
+        if not self._ema_var:
+            return
+        ref = next(iter(self._ema_var.values()))
+        have = torch.tensor([0.0 if self._pending_val is None else 1.0, 0.0], device=ref.device)
+        have = _all_reduce_sum_(have)
+        if have[0] <= 0:
+            return
+        val_var, val_mse = self._pending_val if self._pending_val is not None else ({}, {})
+        self._pending_val = None
+        keys = sorted(self._ema_var)
+        LOGGER.info(
+            "CombinedAdaptiveSpreadController: ratio reduce start (%d structural keys, local val keys %d)",
+            len(keys),
+            len(val_var),
+        )
+        for key in keys:
+            tvar = self._ema_var[key]
+            tmse = self._ema_mse[key]
+            zero = torch.zeros_like(tvar)
+            vvar = _all_reduce_sum_(val_var.get(key, zero).clone().to(tvar.device))
+            vmse = _all_reduce_sum_(val_mse.get(key, zero).clone().to(tvar.device))
+            tvar = _all_reduce_sum_(tvar.clone())
+            tmse = _all_reduce_sum_(tmse.clone())
+            if float(vmse.abs().max()) <= 0.0:
+                continue  # no rank saw validation data for this key
+            ssr_val = ((ens_size + 1) / ens_size * vvar / vmse.clamp(min=1e-30)) ** 0.5
+            ssr_train = ((ens_size + 1) / ens_size * tvar / tmse.clamp(min=1e-30)) ** 0.5
+            ratio = ssr_val / ssr_train.clamp(min=1e-6)
+            ratio[~torch.isfinite(ratio)] = 1.0
+            self._ratio[key] = ratio.cpu()
+        LOGGER.info("CombinedAdaptiveSpreadController: ratio reduce done")
+
+    # ------------------------------------------------------------------ dump & state
+    def _dump(self, trainer: pl.Trainer, global_step: int, med0: float, r_factors: list[list[float]]) -> None:
+        if not self.dump_path or not getattr(trainer, "is_global_zero", True):
+            return
+        rec = {
+            "global_step": global_step,
+            "n_updates": self._n_updates,
+            "ssr_corr_med_r0": med0,
+            "table": {name: [round(float(v), 5) for v in self.table[i]] for i, name in enumerate(self.names) if bool(self.controlled[i])},
+            "a_br": [[round(v, 5) for v in row] for row in self.a_br],
+            "r_factors": [[round(f, 5) for f in row] for row in r_factors],
+            "sign_flips": self._sign_flips,
+            "ratio_med": {f"b{b}r{r}": round(float(t.median()), 5) for (b, r), t in sorted(self._ratio.items())},
+        }
+        p = Path(_per_run_path(self.dump_path, trainer))
+        p.parent.mkdir(parents=True, exist_ok=True)
+        with p.open("a") as f:
+            f.write(json.dumps(rec) + "\n")
+
+    def _live_state(self) -> dict[str, Any]:
+        return {
+            "names": list(self.names),
+            "controlled": self.controlled.tolist() if self.controlled is not None else None,
+            "table": self.table.tolist() if self.table is not None else None,
+            "a_br": [list(row) for row in self.a_br],
+            "ema_var": {f"{b},{r}": t.tolist() for (b, r), t in self._ema_var.items()},
+            "ema_mse": {f"{b},{r}": t.tolist() for (b, r), t in self._ema_mse.items()},
+            "ratio": {f"{b},{r}": t.tolist() for (b, r), t in self._ratio.items()},
+            "last_update_step": self._last_update_step,
+            "freeze_until": self._freeze_until,
+            "last_n_steps": self._last_n_steps,
+            "n_updates": self._n_updates,
+        }
+
+    def _load_live_state(self, state: dict[str, Any]) -> None:
+        def _keyed(d: dict[str, list[float]] | None) -> dict[tuple[int, int], torch.Tensor]:
+            out = {}
+            for k, v in (d or {}).items():
+                b, r = k.split(",")
+                out[(int(b), int(r))] = torch.tensor(v, dtype=torch.float64)
+            return out
+
+        if state.get("table") is not None:
+            self.table = torch.tensor(state["table"], dtype=torch.float64)
+        if state.get("controlled") is not None:
+            self.controlled = torch.tensor(state["controlled"], dtype=torch.bool)
+        if state.get("a_br") is not None:
+            self.a_br = [[float(v) for v in row] for row in state["a_br"]]
+        elif state.get("a_r"):  # legacy shared-a_r checkpoint -> broadcast across bands
+            self.a_br = [[float(v) for v in state["a_r"]] for _ in range(max(1, self._num_bands))]
+        self._ema_var = _keyed(state.get("ema_var"))
+        self._ema_mse = _keyed(state.get("ema_mse"))
+        self._ratio = _keyed(state.get("ratio"))
+        self._last_update_step = int(state.get("last_update_step", -1))
+        self._freeze_until = int(state.get("freeze_until", -1))
+        self._last_n_steps = state.get("last_n_steps")
+        self._n_updates = int(state.get("n_updates", 0))
+
+    def state_dict(self) -> dict[str, Any]:
+        return self._live_state()
+
+    def load_state_dict(self, state_dict: dict[str, Any]) -> None:
+        # pl_module is not available here; re-applied in on_train_start
+        self._pending_state = dict(state_dict) if state_dict else None
+
+
 class CallbackMetricsDump(Callback):
     """Append ``trainer.callback_metrics`` (all logged scalars, epoch-reduced) as one JSON line per
     train/validation epoch end — rank 0 only. A logger-independent record of the metric history
