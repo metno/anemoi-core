@@ -7,13 +7,15 @@
 # granted to it by virtue of its status as an intergovernmental organisation
 # nor does it submit to any jurisdiction.
 
-"""Spread calibration of ensemble models: losses and spread–skill metrics.
+"""Spread calibration of ensemble models: losses, spread–skill metrics and diagnostics.
 
 Reference the classes by full path in hydra configs, e.g.
-``_target_: anemoi.training.spread.SpreadScaledCRPS``.
+``_target_: anemoi.training.spread.SpreadScaledCRPS``.  Lightning callbacks live in
+:mod:`anemoi.training.spread.callbacks` (imported lazily: they pull in pytorch-lightning).
 """
 
 from anemoi.training.spread.crps import SpreadScaledCRPS
+from anemoi.training.spread.diagnostics import TrainingDiagnosticsLossWrapper
 from anemoi.training.spread.metrics import EnsembleMeanSquaredError
 from anemoi.training.spread.metrics import EnsembleVariance
 from anemoi.training.spread.metrics import spread_skill_ratio
@@ -24,5 +26,6 @@ __all__ = [
     "EnsembleVariance",
     "MultiscaleSpreadLossWrapper",
     "SpreadScaledCRPS",
+    "TrainingDiagnosticsLossWrapper",
     "spread_skill_ratio",
 ]
