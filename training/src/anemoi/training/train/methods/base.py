@@ -657,6 +657,7 @@ class BaseTrainingModule(pl.LightningModule, ABC):
         dataset_name: str | None = None,
         pred_layout: IndexSpace | str | None = None,
         target_layout: IndexSpace | str | None = None,
+        rollout_step: int | None = None,
         **_kwargs,
     ) -> torch.Tensor:
         """Compute the loss function.
@@ -700,6 +701,10 @@ class BaseTrainingModule(pl.LightningModule, ABC):
                 grid_dim=self.grid_dim,
                 grid_shard_sizes=self.grid_shard_sizes[dataset_name] if grid_shard_slice is not None else None,
             )
+        # rollout-aware losses opt in via `accepts_rollout_step`; every other loss keeps its exact
+        # call (no unexpected kwargs).
+        if rollout_step is not None and getattr(loss, "accepts_rollout_step", False):
+            loss_kwargs["rollout_step"] = rollout_step
 
         return loss(y_pred, y, **loss_kwargs)
 

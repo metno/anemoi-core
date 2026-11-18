@@ -194,6 +194,7 @@ class EnsembleTraining(BaseTrainingModule):
             dataset_name=dataset_name,
             pred_layout=pred_layout,
             target_layout=target_layout,
+            rollout_step=rollout_step,  # forwarded to rollout-aware losses only
         )
 
         # Compute metrics if in validation mode
