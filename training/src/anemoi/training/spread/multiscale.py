@@ -61,6 +61,37 @@ from anemoi.training.spread.crps import SpreadScaledCRPS
 LOGGER = logging.getLogger(__name__)
 
 
+class ChainedProjectionProvider:
+    """A band smoother given as a PRODUCT of file-backed sparse matrices (experimental).
+
+    ``multiscale_config.loss_matrices`` accepts, in place of one filename, a list ``[M_1, M_2, ..., M_k]`` meaning the
+    operator ``M_1 · M_2 · ... · M_k`` applied RIGHT TO LEFT (``M_k`` first). The n320 coarse band is
+    ``[o96_to_n320_up.npz, o96_gauss_8h.npz, n320_to_o96_down.npz]`` = R_up · G_8h · R_down (within 3 % of the
+    exact n320 Gaussian on smooth fields, σ_eff = the o96 8h kernel's), never formed explicitly (R_up · G_8h · R_down
+    would have ~10⁹ non-zeros at n320). Each factor is an upstream ``ProjectionGraphProvider`` ([out_nodes, in_nodes]
+    CSR); shapes must chain. ``projection_matrix`` is None, so the nnz-based band-order guard skips the chained band.
+    """
+
+    def __init__(self, providers: list) -> None:
+        if len(providers) < 1:
+            raise ValueError("ChainedProjectionProvider needs at least one matrix")
+        shapes = [tuple(p.get_edges().shape) for p in providers]
+        for (o1, i1), (o2, i2) in zip(shapes, shapes[1:], strict=False):
+            if i1 != o2:
+                msg = f"chained loss matrices do not compose: shapes {shapes} (each factor's in_nodes must equal the next one's out_nodes)"
+                raise ValueError(msg)
+        if shapes[0][0] != shapes[-1][1]:
+            msg = f"chained loss matrix product must be square (grid -> grid), got {shapes[0][0]} x {shapes[-1][1]} from {shapes}"
+            raise ValueError(msg)
+        self.providers = list(providers)
+        self.shapes = shapes
+        self.projection_matrix = None
+
+    def get_edges(self, device=None) -> list:  # noqa: ANN001
+        """The factors' CSR matrices on ``device``, in CONFIG order (left to right)."""
+        return [p.get_edges(device=device) for p in self.providers]
+
+
 class MultiscaleSpreadLossWrapper(MultiscaleLossWrapper):
     """:class:`MultiscaleLossWrapper` with a per-band spread adjustment ``a_i``.
 
@@ -360,6 +391,30 @@ class MultiscaleSpreadLossWrapper(MultiscaleLossWrapper):
                 value = metric(band_x, band_y, squash=False, **self._band_diag_kwargs)
                 self._band_diag_values[f"{name}_band{i}"] = value.detach().float()
 
+    def _load_file_smoothing_matrices(self, loss_matrices_path, loss_matrices):  # noqa: ANN001, ANN201 - parent signature
+        """Parent file mode, plus list entries = chained products (:class:`ChainedProjectionProvider`)."""
+        from omegaconf import ListConfig
+
+        if not loss_matrices or not any(isinstance(e, (list, tuple, ListConfig)) for e in loss_matrices):
+            return super()._load_file_smoothing_matrices(loss_matrices_path, loss_matrices)
+        out = []
+        for entry in loss_matrices:
+            if isinstance(entry, (list, tuple, ListConfig)):
+                factors = [super(MultiscaleSpreadLossWrapper, self)._load_file_smoothing_matrices(loss_matrices_path, [f])[0] for f in entry]
+                if any(f is None for f in factors):
+                    raise ValueError(f"a chained loss-matrix entry may not contain null: {list(entry)}")
+                prov = ChainedProjectionProvider(factors)
+                LOGGER.info("Loss smoothing: chained %s (applied right to left), shapes %s", list(entry), prov.shapes)
+                out.append(prov)
+            else:
+                out.extend(super()._load_file_smoothing_matrices(loss_matrices_path, [entry]))
+        return out
+
+    def _project_chain(self, x, prov: ChainedProjectionProvider):  # noqa: ANN001, ANN201
+        for mat in reversed(prov.get_edges(device=x.device)):
+            x = self.projector(x, mat, num_chunks=self.sparse_projector_num_chunks)
+        return x
+
     def _smooth_for_loss(self, x, y, i: int):  # noqa: ANN001, ANN201 - signature fixed by parent
         """Parent hook, called once per band ``i`` right before the per-band loss call.
 
@@ -377,7 +432,11 @@ class MultiscaleSpreadLossWrapper(MultiscaleLossWrapper):
             raise RuntimeError(msg)
         self._band_cursor = i
         self._set_band_spread_adjustment(i)
-        sx, sy = super()._smooth_for_loss(x, y, i)
+        prov = self.smoothing_matrices[i]
+        if isinstance(prov, ChainedProjectionProvider):
+            sx, sy = self._project_chain(x, prov), self._project_chain(y, prov)
+        else:
+            sx, sy = super()._smooth_for_loss(x, y, i)
         if self._band_diag_active:
             self._record_band_diagnostics(sx, sy, i)
         return sx, sy

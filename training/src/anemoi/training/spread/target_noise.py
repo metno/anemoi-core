@@ -249,6 +249,108 @@ class TargetNoise:
         return y
 
 
+def chain_row_variance(interpolators: Sequence[sp.spmatrix], smoother: sp.spmatrix, *, chunk_rows: int = 8192) -> np.ndarray:
+    """Pointwise variance of ``P ξ`` for white ξ, ``P = I_1 · … · I_m · diag(1/‖S_i‖) S`` (the chained target noise):
+    ``diag(P Pᵀ)``, computed in row chunks without forming P (at n320 P would hold ~10⁹ non-zeros). Exact."""
+    s = sp.csr_matrix(smoother, dtype=np.float64)
+    inv = 1.0 / np.sqrt(np.asarray(s.multiply(s).sum(axis=1)).ravel())
+    s_unit = sp.diags(inv) @ s
+    lead = sp.csr_matrix(interpolators[0], dtype=np.float64)
+    for m in interpolators[1:]:
+        lead = lead @ sp.csr_matrix(m, dtype=np.float64)
+    out = np.empty(lead.shape[0])
+    for a in range(0, lead.shape[0], chunk_rows):
+        blk = lead[a:a + chunk_rows] @ s_unit
+        out[a:a + chunk_rows] = np.asarray(blk.multiply(blk).sum(axis=1)).ravel()
+    return out
+
+
+class ChainedTargetNoise(TargetNoise):
+    """Target noise generated on a COARSE grid and interpolated:
+    ``noise_chain = [I_1, …, I_m, S]`` as written in the config, applied right to left: white ξ on the coarse grid →
+    the square smoother ``S`` (row-l2 normalised: unit variance on the coarse grid, as :class:`TargetNoise`) → the
+    interpolators ``I_m`` … ``I_1`` (e.g. ``[o96_to_n320_up.npz, o96_gauss_8h.npz]``: the o96 8h noise on the n320 grid)
+    → × ``inv_std`` so every fine node has unit variance exactly (``chain_row_variance``; for large grids precompute it
+    once and pass the .npy). Everything
+    downstream (amplitude tables, per-step rows, dose map on the FINE grid, seeding, sharding) is the base class's.
+    The base class's own single-smoother path is untouched."""
+
+    def __init__(
+        self,
+        noise_chain: Sequence[str | Path | sp.spmatrix],
+        amplitudes_full: torch.Tensor,
+        *,
+        inv_std: str | Path | np.ndarray | None = None,
+        anneal_steps: int | None = None,
+        seed: int = 0,
+        dose_map: torch.Tensor | None = None,
+    ) -> None:
+        mats = [sp.load_npz(m) if isinstance(m, (str, Path)) else m for m in noise_chain]
+        if len(mats) < 2:
+            raise ValueError("noise_chain needs at least one interpolator and the coarse smoother (last)")
+        interps, smoother = mats[:-1], mats[-1]
+        shapes = [tuple(m.shape) for m in mats]
+        for (o1, i1), (o2, i2) in zip(shapes, shapes[1:], strict=False):
+            if i1 != o2:
+                raise ValueError(f"noise_chain matrices do not compose: {shapes}")
+        if shapes[-1][0] != shapes[-1][1]:
+            raise ValueError(f"the last noise_chain matrix (the smoother) must be square, got {shapes[-1]}")
+        # the base class builds the COARSE smoother state (its csr, row-l2 normalisation); a dose map must be on the
+        # FINE grid, so it is attached after the base init with the fine n_grid
+        super().__init__(smoother, amplitudes_full, anneal_steps=anneal_steps, seed=seed, dose_map=None)
+        self.n_coarse = self.n_grid
+        self.n_grid = int(shapes[0][0])
+        self._interp_cpu = [sp.csr_matrix(m, dtype=np.float32) for m in interps]
+        if inv_std is None:
+            var = chain_row_variance(interps, smoother)
+            inv = 1.0 / np.sqrt(var)
+        else:
+            inv = np.load(inv_std) if isinstance(inv_std, (str, Path)) else np.asarray(inv_std)
+            inv = inv.astype(np.float64).ravel()
+        if inv.shape != (self.n_grid,) or not np.all(np.isfinite(inv)) or not np.all(inv > 0):
+            raise ValueError(f"noise_chain inv_std must be ({self.n_grid},) positive finite, got {inv.shape}")
+        self._inv_std_cpu = torch.from_numpy(inv.astype(np.float32))
+        self._chain_dev: dict[torch.device, tuple[list[torch.Tensor], torch.Tensor]] = {}
+        if dose_map is not None:
+            dm = dose_map.detach().float().clone()
+            if dm.shape != (self.n_grid, self._amps_steps.shape[1]):
+                raise ValueError(f"dose_map must be (n_grid, n_full) = ({self.n_grid}, {self._amps_steps.shape[1]}), got {tuple(dm.shape)}")
+            if not torch.all(dm >= 0):
+                raise ValueError("dose_map must be non-negative")
+            if not torch.all(dm == 1.0):
+                self._dose_map_cpu = dm
+
+    def _chain_on(self, device: torch.device) -> tuple[list[torch.Tensor], torch.Tensor]:
+        if device not in self._chain_dev:
+            mats = []
+            for m in self._interp_cpu:
+                mats.append(torch.sparse_csr_tensor(torch.from_numpy(m.indptr.astype(np.int64)), torch.from_numpy(m.indices.astype(np.int64)),
+                                                    torch.from_numpy(m.data), size=m.shape).to(device))
+            self._chain_dev[device] = (mats, self._inv_std_cpu.to(device))
+        return self._chain_dev[device]
+
+    def _on(self, device: torch.device) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        # the base caches the coarse smoother with a zero-vector self-test of size n_grid: run it on the coarse size
+        n_fine = self.n_grid
+        self.n_grid = self.n_coarse
+        try:
+            return super()._on(device)
+        finally:
+            self.n_grid = n_fine
+
+    def coloured_unit_noise(self, n_fields: int, *, device: torch.device, seed: int) -> torch.Tensor:
+        """``(n_grid_fine, n_fields)``: white on the coarse grid → S (unit rows) → interpolators → × inv_std."""
+        csr, inv_row_l2, _ = self._on(device)
+        mats, inv_std = self._chain_on(device)
+        gen = torch.Generator(device=device)
+        gen.manual_seed(int(seed))
+        xi = torch.randn(self.n_coarse, n_fields, generator=gen, device=device, dtype=torch.float32)
+        f = torch.sparse.mm(csr, xi) * inv_row_l2[:, None]
+        for m in reversed(mats):
+            f = torch.sparse.mm(m, f)
+        return f * inv_std[:, None]
+
+
 def build_target_noise(
     cfg: Mapping[str, Any] | DictConfig,
     *,
@@ -256,7 +358,8 @@ def build_target_noise(
 ) -> TargetNoise:
     """Build a :class:`TargetNoise` from the ``training.target_noise`` block and the dataset's data indices."""
     cfg = OmegaConf.to_container(cfg, resolve=True) if isinstance(cfg, DictConfig) else dict(cfg)
-    known = {"enabled", "smoother", "amplitude_table", "amplitude_fraction", "exclude_variables", "include_variables", "anneal_steps", "seed", "dose_map"}
+    known = {"enabled", "smoother", "amplitude_table", "amplitude_fraction", "exclude_variables", "include_variables", "anneal_steps", "seed", "dose_map",
+             "noise_chain", "noise_chain_inv_std"}
     unknown = sorted(set(cfg) - known)
     if unknown:
         msg = f"training.target_noise: unknown keys {unknown}; known: {sorted(known)}"
@@ -303,6 +406,14 @@ def build_target_noise(
     dose_map = None
     if cfg.get("dose_map"):
         dose_map = load_dose_map(cfg["dose_map"], name_to_index=name_to_index, active_names=[v for v in out_names if v not in exclude], n_full=n_full)
+    if cfg.get("noise_chain"):
+        if cfg.get("smoother"):
+            raise ValueError("training.target_noise: noise_chain replaces 'smoother'")
+        tn = ChainedTargetNoise(list(cfg["noise_chain"]), amps, inv_std=cfg.get("noise_chain_inv_std"), anneal_steps=cfg.get("anneal_steps"),
+                                seed=int(cfg.get("seed", 0)), dose_map=dose_map)
+        LOGGER.info("ChainedTargetNoise: %s (right to left), coarse %d -> fine %d nodes, inv_std %s",
+                    [Path(str(m)).name for m in cfg["noise_chain"]], tn.n_coarse, tn.n_grid, cfg.get("noise_chain_inv_std") or "computed")
+        return tn
     return TargetNoise(cfg["smoother"], amps, anneal_steps=cfg.get("anneal_steps"), seed=int(cfg.get("seed", 0)), dose_map=dose_map)
 
 
