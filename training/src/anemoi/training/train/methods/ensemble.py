@@ -229,6 +229,20 @@ class EnsembleTraining(BaseTrainingModule):
             **kwargs,
         )
 
+    def _checkpoint_loss(self) -> bool:
+        """Whether the loss is evaluated under gradient checkpointing (``training.checkpoint_loss``, default True).
+
+        Checkpointing recomputes the forward pass of every loss term during the backward pass. It keeps the loss
+        intermediates of earlier rollout steps out of memory; with a single rollout step there is nothing to keep out,
+        and ``training.checkpoint_loss: False`` saves one evaluation of every loss term per step. The gradients are the same.
+        """
+        if not hasattr(self, "_checkpoint_loss_flag"):
+            training = self.config.training
+            value = training.get("checkpoint_loss", True) if hasattr(training, "get") else getattr(training, "checkpoint_loss", True)
+            self._checkpoint_loss_flag = bool(value)
+            LOGGER.info("Loss evaluated %s gradient checkpointing.", "under" if self._checkpoint_loss_flag else "WITHOUT")
+        return self._checkpoint_loss_flag
+
     def _step(
         self,
         batch: dict[str, torch.Tensor],
@@ -248,16 +262,26 @@ class EnsembleTraining(BaseTrainingModule):
 
             y = self.task.get_targets(batch, **task_step_kwargs)
 
-            loss_next, metrics_next, y_preds_next = checkpoint(
-                self.compute_loss_metrics,
-                y_pred,
-                y,
-                **task_step_kwargs,
-                validation_mode=validation_mode,
-                pred_layout=IndexSpace.MODEL_OUTPUT,
-                target_layout=IndexSpace.DATA_FULL,
-                use_reentrant=False,
-            )
+            if self._checkpoint_loss():
+                loss_next, metrics_next, y_preds_next = checkpoint(
+                    self.compute_loss_metrics,
+                    y_pred,
+                    y,
+                    **task_step_kwargs,
+                    validation_mode=validation_mode,
+                    pred_layout=IndexSpace.MODEL_OUTPUT,
+                    target_layout=IndexSpace.DATA_FULL,
+                    use_reentrant=False,
+                )
+            else:
+                loss_next, metrics_next, y_preds_next = self.compute_loss_metrics(
+                    y_pred,
+                    y,
+                    **task_step_kwargs,
+                    validation_mode=validation_mode,
+                    pred_layout=IndexSpace.MODEL_OUTPUT,
+                    target_layout=IndexSpace.DATA_FULL,
+                )
 
             # Advance input state for each dataset if another step follows
             if i < len(task_steps) - 1:
