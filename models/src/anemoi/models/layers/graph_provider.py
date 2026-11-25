@@ -533,6 +533,9 @@ class ProjectionGraphProvider(BaseGraphProvider):
         new = cls.__new__(cls)
         memo[id(self)] = new
         memo[id(self.projection_matrix)] = self.projection_matrix
+        transposed = self.__dict__.get("projection_matrix_t")
+        if transposed is not None:
+            memo[id(transposed)] = transposed
         for key, value in self.__dict__.items():
             new.__dict__[key] = copy.deepcopy(value, memo)
         return new
@@ -612,6 +615,38 @@ class ProjectionGraphProvider(BaseGraphProvider):
             size=matrix.shape,
         )
         self._edge_dim = self.projection_matrix.shape[1]
+        # Transposed copy for the backward pass of the sparse product, built on request (get_transposed_edges):
+        # torch would otherwise re-derive the transpose from the CSR matrix on EVERY backward call (9x the cost of
+        # the product itself for a 1.7e8-entry smoother).
+        self.projection_matrix_t = None
+
+    def get_transposed_edges(self, device: Optional[torch.device] = None) -> Tensor:
+        """Return the transposed projection matrix (CSR), for the backward pass of ``matrix @ x``.
+
+        Built once, on the CPU with SciPy (no GPU work space needed), then kept on ``device``.
+        """
+        if self.projection_matrix_t is None:
+            from scipy.sparse import csr_matrix
+
+            m = self.projection_matrix
+            transposed = (
+                csr_matrix(
+                    (m.values().cpu().numpy(), m.col_indices().cpu().numpy(), m.crow_indices().cpu().numpy()),
+                    shape=tuple(m.shape),
+                )
+                .transpose()
+                .tocsr()
+            )
+            transposed.sum_duplicates()
+            self.projection_matrix_t = torch.sparse_csr_tensor(
+                torch.from_numpy(transposed.indptr),
+                torch.from_numpy(transposed.indices),
+                torch.from_numpy(transposed.data),
+                size=transposed.shape,
+            )
+        if device is not None and self.projection_matrix_t.device != torch.device(device):
+            self.projection_matrix_t = self.projection_matrix_t.to(device=device)
+        return self.projection_matrix_t
 
     @staticmethod
     def _row_normalize_matrix(matrix: spmatrix) -> spmatrix:

@@ -60,3 +60,23 @@ def test_forward_uses_configured_num_chunks(csr_matrix: torch.Tensor) -> None:
     chunked = SparseProjector(autocast=False, num_chunks=3)(x, csr_matrix)
     unchunked = SparseProjector(autocast=False, num_chunks=1)(x, csr_matrix)
     assert chunked.shape == unchunked.shape
+
+
+@pytest.mark.parametrize("num_chunks", [1, 3])
+def test_prepared_transpose_gives_the_same_gradient(
+    projector: SparseProjector,
+    csr_matrix: torch.Tensor,
+    num_chunks: int,
+) -> None:
+    """A transposed matrix prepared in advance changes neither the result nor the gradient."""
+    transposed = csr_matrix.to_sparse_coo().t().coalesce().to_sparse_csr()
+    x = torch.rand(3, csr_matrix.shape[1], 4, requires_grad=True)
+    weight = torch.rand(3, csr_matrix.shape[0], 4)
+
+    out_ref = projector(x, csr_matrix, num_chunks=num_chunks)
+    (grad_ref,) = torch.autograd.grad((out_ref * weight).sum(), x)
+    out = projector(x, csr_matrix, num_chunks=num_chunks, transposed_matrix=transposed)
+    (grad,) = torch.autograd.grad((out * weight).sum(), x)
+
+    torch.testing.assert_close(out, out_ref)
+    torch.testing.assert_close(grad, grad_ref)

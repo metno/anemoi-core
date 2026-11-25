@@ -10,6 +10,26 @@
 import torch
 
 
+class _SparseMMPreparedTranspose(torch.autograd.Function):
+    """``matrix @ x`` whose backward pass uses a transposed matrix prepared in advance.
+
+    Same result as ``torch.sparse.mm``; the built-in backward transposes the CSR matrix on every call.
+    """
+
+    @staticmethod
+    def forward(ctx, x: torch.Tensor, matrix: torch.Tensor, matrix_t: torch.Tensor) -> torch.Tensor:  # noqa: ANN001
+        ctx.matrix_t = matrix_t
+        return torch.sparse.mm(matrix, x)
+
+    @staticmethod
+    @torch.autograd.function.once_differentiable
+    def backward(ctx, grad_output: torch.Tensor) -> tuple:  # noqa: ANN001
+        matrix_t = ctx.matrix_t
+        with torch.amp.autocast(device_type=grad_output.device.type, enabled=False):
+            grad = torch.sparse.mm(matrix_t, grad_output.to(matrix_t.dtype))
+        return grad.to(grad_output.dtype), None, None
+
+
 class SparseProjector(torch.nn.Module):
     """Applies a sparse projection matrix to input tensors.
 
@@ -37,6 +57,7 @@ class SparseProjector(torch.nn.Module):
         x: torch.Tensor,
         projection_matrix: torch.Tensor,
         num_chunks: int | None = None,
+        transposed_matrix: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Apply sparse projection.
 
@@ -50,6 +71,10 @@ class SparseProjector(torch.nn.Module):
             Number of chunks to project with sparse matmul. ``1``
             projects all in one matmul. Defaults to the value configured
             when constructing the projector.
+        transposed_matrix : torch.Tensor, optional
+            The transposed projection matrix (CSR, same device). If given it is used in the backward
+            pass instead of letting autograd transpose ``projection_matrix`` on every call; the
+            result is the same.
 
         Returns
         -------
@@ -62,10 +87,13 @@ class SparseProjector(torch.nn.Module):
 
         try:
             if num_chunks == 1:
-                out = self._project_flattened(x, projection_matrix)
+                out = self._project_flattened(x, projection_matrix, transposed_matrix)
             else:
                 out = torch.cat(
-                    [self._project_flattened(chunk, projection_matrix) for chunk in torch.chunk(x, num_chunks, dim=0)],
+                    [
+                        self._project_flattened(chunk, projection_matrix, transposed_matrix)
+                        for chunk in torch.chunk(x, num_chunks, dim=0)
+                    ],
                     dim=0,
                 )
         except torch.cuda.OutOfMemoryError as e:
@@ -75,7 +103,12 @@ class SparseProjector(torch.nn.Module):
 
         return out.reshape(*input_shape[:-2], *out.shape[-2:])
 
-    def _project_flattened(self, x: torch.Tensor, projection_matrix: torch.Tensor) -> torch.Tensor:
+    def _project_flattened(
+        self,
+        x: torch.Tensor,
+        projection_matrix: torch.Tensor,
+        transposed_matrix: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         """Project an input whose leading dimensions have already been flattened.
 
         Expected x shape: [flat_batch, input_nodes, channels]
@@ -95,7 +128,10 @@ class SparseProjector(torch.nn.Module):
         with torch.amp.autocast(device_type=x.device.type, enabled=self.autocast):
             # One sparse matmul instead of B sparse matmuls:
             # [M, N] @ [N, B*C] -> [M, B*C]
-            out = torch.sparse.mm(projection_matrix, x_rhs)
+            if transposed_matrix is not None and x_rhs.requires_grad:
+                out = _SparseMMPreparedTranspose.apply(x_rhs, projection_matrix, transposed_matrix)
+            else:
+                out = torch.sparse.mm(projection_matrix, x_rhs)
 
         output_nodes = out.shape[0]
 
