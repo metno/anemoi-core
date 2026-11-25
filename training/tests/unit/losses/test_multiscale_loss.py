@@ -329,8 +329,54 @@ def test_multiscale_loss_uses_grid_shard_sizes_for_sharding(
     )
 
     prepare.assert_called_once_with(pred, target, group, grid_shard_sizes)
-    # Two all_to_all_transpose calls: one for y_pred_ens_tmp, one for y_tmp
+    # The only scale is unsmoothed: the all-to-all there and back would be the identity, so the
+    # grid-sharded inputs are used as they are
+    assert a2a.call_count == 0
+
+
+def test_multiscale_loss_transposes_back_smoothed_scales_only(
+    mocker: MockerFixture,
+) -> None:
+    per_scale_loss = TrackingLoss()
+    multiscale_loss = MultiscaleLossWrapper(
+        per_scale_loss=per_scale_loss,
+        weights=[1.0],
+    )
+    # one smoothed scale followed by the unsmoothed one (the smoothing itself is mocked)
+    multiscale_loss.smoothing_matrices = [object(), None]
+    multiscale_loss.weights = [1.0, 1.0]
+    pred = torch.zeros((1, 1, 1, 2, 1))
+    target = torch.zeros((1, 1, 1, 2, 1))
+    mocker.patch.object(multiscale_loss, "_prepare_for_smoothing", return_value=(pred, target, [1, 1], [1, 1]))
+    mocker.patch.object(multiscale_loss, "_smooth_for_loss", side_effect=lambda x, y, _i: (x, y))
+    a2a = mocker.patch(
+        "anemoi.training.losses.multiscale.all_to_all_transpose",
+        side_effect=lambda x, *_args: x,
+    )
+
+    multiscale_loss(pred, target, group=FakeGroup(size=2), grid_shard_sizes=[1, 1])
+
+    # Two all_to_all_transpose calls (y_pred_ens_tmp and y_tmp) for the smoothed scale, none for the unsmoothed one
     assert a2a.call_count == 2
+    assert len(per_scale_loss.calls) == 2
+
+
+def test_multiscale_loss_skips_zero_weight_scales(mocker: MockerFixture) -> None:
+    per_scale_loss = TrackingLoss()
+    multiscale_loss = MultiscaleLossWrapper(
+        per_scale_loss=per_scale_loss,
+        weights=[1.0],
+    )
+    multiscale_loss.smoothing_matrices = [object(), object(), None]
+    multiscale_loss.weights = [0.0, 1.0, 1.0]
+    mocker.patch.object(multiscale_loss, "_smooth_for_loss", side_effect=lambda x, y, _i: (x, y))
+    pred = torch.zeros((1, 1, 1, 2, 1))
+    target = torch.zeros((1, 1, 1, 2, 1))
+
+    multiscale_loss(pred, target)
+
+    # the zero-weight scale is smoothed (the next band needs it) but its loss is not evaluated
+    assert len(per_scale_loss.calls) == 2
 
 
 def test_multiscale_loss_forwards_extra_kwargs() -> None:

@@ -26,6 +26,7 @@ from anemoi.models.distributed.shapes import ShardSizes
 from anemoi.models.distributed.shapes import get_shard_sizes
 from anemoi.models.layers.graph_provider import ProjectionGraphProvider
 from anemoi.models.layers.sparse_projector import SparseProjector
+from anemoi.training.losses import _timing
 from anemoi.training.losses.base import BaseLoss
 from anemoi.training.losses.base import BaseLossWrapper
 
@@ -301,14 +302,21 @@ class MultiscaleLossWrapper(BaseLossWrapper):
             channel_shard_sizes_y,
         )
 
+    def _timed_prepare_for_smoothing(self, y_pred_ens, y, group, grid_shard_sizes):  # noqa: ANN001, ANN202
+        with _timing.section("ms:a2a_in"):
+            return self._prepare_for_smoothing(y_pred_ens, y, group, grid_shard_sizes)
+
     def _smooth_for_loss(self, x: torch.Tensor, y: torch.Tensor, i: int) -> tuple[torch.Tensor, torch.Tensor]:
         """Apply smoothing matrix to predictions and targets for loss computation."""
         if self.smoothing_matrices[i] is not None:
             projection_matrix = self.smoothing_matrices[i].get_edges(device=x.device)
+            # prepared transpose for the backward pass (the targets carry no gradient)
+            transposed = self.smoothing_matrices[i].get_transposed_edges(device=x.device) if x.requires_grad else None
             x = self.projector(
                 x,
                 projection_matrix,
                 num_chunks=self.sparse_projector_num_chunks,
+                transposed_matrix=transposed,
             )
             y = self.projector(
                 y,
@@ -341,12 +349,7 @@ class MultiscaleLossWrapper(BaseLossWrapper):
                 y_for_smooth,
                 channel_shard_sizes_pred,
                 channel_shard_sizes_y,
-            ) = self._prepare_for_smoothing(
-                y_pred_ens,
-                y,
-                group,
-                grid_shard_sizes,
-            )
+            ) = self._timed_prepare_for_smoothing(y_pred_ens, y, group, grid_shard_sizes)
         else:
             y_pred_ens_for_smooth = y_pred_ens
             y_for_smooth = y
@@ -363,30 +366,35 @@ class MultiscaleLossWrapper(BaseLossWrapper):
                 )
 
             # smooth the predictions and the truth for loss computation
-            y_pred_ens_tmp, y_tmp = self._smooth_for_loss(
-                y_pred_ens_for_smooth,
-                y_for_smooth,
-                i,
-            )
+            with _timing.section(f"ms:smooth{i}"):
+                y_pred_ens_tmp, y_tmp = self._smooth_for_loss(
+                    y_pred_ens_for_smooth,
+                    y_for_smooth,
+                    i,
+                )
 
-            if is_model_sharded:
+            if is_model_sharded and provider is None:
+                # unsmoothed scale: the all-to-all there and back is the identity, use the grid-sharded inputs as they are
+                y_pred_ens_tmp, y_tmp = y_pred_ens, y
+            elif is_model_sharded:
                 # channel-sharded -> grid-sharded: reverse the all-to-all
-                y_pred_ens_tmp = all_to_all_transpose(
-                    y_pred_ens_tmp,
-                    -2,
-                    grid_shard_sizes,
-                    -1,
-                    channel_shard_sizes_pred,
-                    group,
-                )
-                y_tmp = all_to_all_transpose(
-                    y_tmp,
-                    -2,
-                    grid_shard_sizes,
-                    -1,
-                    channel_shard_sizes_y,
-                    group,
-                )
+                with _timing.section(f"ms:a2a_out{i}"):
+                    y_pred_ens_tmp = all_to_all_transpose(
+                        y_pred_ens_tmp,
+                        -2,
+                        grid_shard_sizes,
+                        -1,
+                        channel_shard_sizes_pred,
+                        group,
+                    )
+                    y_tmp = all_to_all_transpose(
+                        y_tmp,
+                        -2,
+                        grid_shard_sizes,
+                        -1,
+                        channel_shard_sizes_y,
+                        group,
+                    )
 
             current_y_pred_ens = y_pred_ens_tmp
             current_y = y_tmp
@@ -398,6 +406,11 @@ class MultiscaleLossWrapper(BaseLossWrapper):
             prev_y_pred_ens = current_y_pred_ens
             prev_y = current_y
 
+            if weight == 0:
+                # a scale with weight zero adds nothing to the loss or its gradient: its smoothed fields are only
+                # needed for the next band, so the loss evaluation (and its backward pass) is left out
+                continue
+
             # sharding kwargs - only pass if the loss needs them
             sharding_kwargs = (
                 {"grid_shard_sizes": grid_shard_sizes, "grid_dim": grid_dim}
@@ -405,9 +418,8 @@ class MultiscaleLossWrapper(BaseLossWrapper):
                 else {}
             )
             # compute the loss
-            weighted_losses.append(
-                weight
-                * self.loss(
+            with _timing.section(f"ms:loss{i}"):
+                scale_loss = self.loss(
                     y_pred_ens_tmp,
                     y_tmp,
                     squash=squash,
@@ -417,9 +429,10 @@ class MultiscaleLossWrapper(BaseLossWrapper):
                     group=group,
                     **sharding_kwargs,
                     **kwargs,
-                ),
-            )
+                )
+            weighted_losses.append(weight * scale_loss)
 
         # The scale dimension is internal to this wrapper. Return the same
         # scalar or per-variable shape as the wrapped loss.
+        assert weighted_losses, "MultiscaleLossWrapper: every scale has weight zero"
         return torch.stack(weighted_losses).sum(dim=0)

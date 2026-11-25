@@ -17,6 +17,7 @@ import torch
 from omegaconf import DictConfig
 
 from anemoi.models.data_indices.collection import IndexCollection
+from anemoi.training.losses import _timing
 from anemoi.training.losses.base import BaseLoss
 from anemoi.training.losses.base import LossFactoryContextKey
 from anemoi.training.losses.loss import get_loss_function
@@ -183,13 +184,25 @@ class CombinedLoss(BaseLoss):
         torch.Tensor
             Combined loss
         """
+        timed = _timing.ENABLED and pred.requires_grad  # training steps only
+        if timed:
+            _timing.step()
         loss = None
         for i, loss_fn in enumerate(self.losses):
             loss_kwargs = self._forward_kwargs_for_loss(loss_fn, kwargs)
-            if loss is not None:
-                loss += self.loss_weights[i] * loss_fn(pred, target, **loss_kwargs)
+            if timed:
+                with _timing.section(f"term{i}:{type(loss_fn).__name__}"):
+                    value = loss_fn(pred, target, **loss_kwargs)
             else:
-                loss = self.loss_weights[i] * loss_fn(pred, target, **loss_kwargs)
+                value = loss_fn(pred, target, **loss_kwargs)
+            if _timing.VALUES and not pred.requires_grad:  # validation batches: unweighted value of every term
+                fields = getattr(loss_fn, "predicted_variables", None)
+                label = f"term{i}:{type(getattr(loss_fn, 'loss', loss_fn)).__name__}" + (f"[{','.join(fields)}]" if fields else "")
+                _timing.record_value(label, value, self.loss_weights[i])
+            if loss is not None:
+                loss += self.loss_weights[i] * value
+            else:
+                loss = self.loss_weights[i] * value
         return loss
 
     @functools.wraps(ScaleTensor.add_scaler, assigned=("__doc__", "__annotations__"))
